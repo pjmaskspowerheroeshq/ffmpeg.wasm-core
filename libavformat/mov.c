@@ -290,10 +290,14 @@ static int mov_metadata_hmmt(MOVContext *c, AVIOContext *pb, unsigned len)
         return 0;
 
     n_hmmt = avio_rb32(pb);
+    if (n_hmmt > len / 4)
+        return AVERROR_INVALIDDATA;
     for (i = 0; i < n_hmmt && !pb->eof_reached; i++) {
         int moment_time = avio_rb32(pb);
         avpriv_new_chapter(c->fc, i, av_make_q(1, 1000), moment_time, AV_NOPTS_VALUE, NULL);
     }
+    if (avio_feof(pb))
+        return AVERROR_INVALIDDATA;
     return 0;
 }
 
@@ -304,7 +308,8 @@ static int mov_read_udta_string(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     char *str = NULL;
     const char *key = NULL;
     uint16_t langcode = 0;
-    uint32_t data_type = 0, str_size, str_size_alloc;
+    uint32_t data_type = 0, str_size_alloc;
+    uint64_t str_size;
     int (*parse)(MOVContext*, AVIOContext*, unsigned, const char*) = NULL;
     int raw = 0;
     int num = 0;
@@ -404,7 +409,7 @@ retry:
     if (c->itunes_metadata && atom.size > 8) {
         int data_size = avio_rb32(pb);
         int tag = avio_rl32(pb);
-        if (tag == MKTAG('d','a','t','a') && data_size <= atom.size) {
+        if (tag == MKTAG('d','a','t','a') && data_size <= atom.size && data_size >= 16) {
             data_type = avio_rb32(pb); // type
             avio_rb32(pb); // unknown
             str_size = data_size - 16;
@@ -601,10 +606,12 @@ static int mov_read_dref(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     for (i = 0; i < entries; i++) {
         MOVDref *dref = &sc->drefs[i];
         uint32_t size = avio_rb32(pb);
-        int64_t next = avio_tell(pb) + size - 4;
+        int64_t next = avio_tell(pb);
 
-        if (size < 12)
+        if (size < 12 || next < 0 || next > INT64_MAX - size)
             return AVERROR_INVALIDDATA;
+
+        next += size - 4;
 
         dref->type = avio_rl32(pb);
         avio_rb32(pb); // version + flags
@@ -1110,6 +1117,12 @@ static int mov_read_ftyp(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     int ret = ffio_read_size(pb, type, 4);
     if (ret < 0)
         return ret;
+    if (c->fc->nb_streams) {
+        if (c->fc->strict_std_compliance >= FF_COMPLIANCE_STRICT)
+            return AVERROR_INVALIDDATA;
+        av_log(c->fc, AV_LOG_DEBUG, "Ignoring duplicate FTYP\n");
+        return 0;
+    }
 
     if (strcmp(type, "qt  "))
         c->isom = 1;
@@ -1119,7 +1132,7 @@ static int mov_read_ftyp(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     av_dict_set_int(&c->fc->metadata, "minor_version", minor_ver, 0);
 
     comp_brand_size = atom.size - 8;
-    if (comp_brand_size < 0)
+    if (comp_brand_size < 0 || comp_brand_size == INT_MAX)
         return AVERROR_INVALIDDATA;
     comp_brands_str = av_malloc(comp_brand_size + 1); /* Add null terminator */
     if (!comp_brands_str)
@@ -1912,6 +1925,8 @@ static int mov_read_glbl(MOVContext *c, AVIOContext *pb, MOVAtom atom)
         // wrap a whole fiel atom inside of a glbl atom.
         unsigned size = avio_rb32(pb);
         unsigned type = avio_rl32(pb);
+        if (avio_feof(pb))
+            return AVERROR_INVALIDDATA;
         avio_seek(pb, -8, SEEK_CUR);
         if (type == MKTAG('f','i','e','l') && size == atom.size)
             return mov_read_default(c, pb, atom);
@@ -2009,8 +2024,10 @@ static int mov_read_stco(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     if (!entries)
         return 0;
 
-    if (sc->chunk_offsets)
-        av_log(c->fc, AV_LOG_WARNING, "Duplicated STCO atom\n");
+    if (sc->chunk_offsets) {
+        av_log(c->fc, AV_LOG_WARNING, "Ignoring duplicated STCO atom\n");
+        return 0;
+    }
     av_free(sc->chunk_offsets);
     sc->chunk_count = 0;
     sc->chunk_offsets = av_malloc_array(entries, sizeof(*sc->chunk_offsets));
@@ -2022,8 +2039,13 @@ static int mov_read_stco(MOVContext *c, AVIOContext *pb, MOVAtom atom)
         for (i = 0; i < entries && !pb->eof_reached; i++)
             sc->chunk_offsets[i] = avio_rb32(pb);
     else if (atom.type == MKTAG('c','o','6','4'))
-        for (i = 0; i < entries && !pb->eof_reached; i++)
+        for (i = 0; i < entries && !pb->eof_reached; i++) {
             sc->chunk_offsets[i] = avio_rb64(pb);
+            if (sc->chunk_offsets[i] < 0) {
+                av_log(c->fc, AV_LOG_WARNING, "Impossible chunk_offset\n");
+                sc->chunk_offsets[i] = 0;
+            }
+        }
     else
         return AVERROR_INVALIDDATA;
 
@@ -2231,7 +2253,7 @@ static void mov_parse_stsd_audio(MOVContext *c, AVIOContext *pb,
     }
 
     bits_per_sample = av_get_bits_per_sample(st->codecpar->codec_id);
-    if (bits_per_sample) {
+    if (bits_per_sample && (bits_per_sample >> 3) * (uint64_t)st->codecpar->channels <= INT_MAX) {
         st->codecpar->bits_per_coded_sample = bits_per_sample;
         sc->sample_size = (bits_per_sample >> 3) * st->codecpar->channels;
     }
@@ -2328,12 +2350,10 @@ FF_ENABLE_DEPRECATION_WARNINGS
             if (tmcd_ctx->tmcd_flags & 0x0008) {
                 int timescale = AV_RB32(st->codecpar->extradata + 8);
                 int framedur = AV_RB32(st->codecpar->extradata + 12);
-                st->avg_frame_rate.num *= timescale;
-                st->avg_frame_rate.den *= framedur;
+                st->avg_frame_rate = av_mul_q(st->avg_frame_rate, (AVRational){timescale, framedur});
 #if FF_API_LAVF_AVCTX
 FF_DISABLE_DEPRECATION_WARNINGS
-                st->codec->time_base.den *= timescale;
-                st->codec->time_base.num *= framedur;
+                st->codec->time_base = av_mul_q(st->codec->time_base , (AVRational){framedur, timescale});
 FF_ENABLE_DEPRECATION_WARNINGS
 #endif
             }
@@ -2528,6 +2548,10 @@ int ff_mov_read_stsd_entries(MOVContext *c, AVIOContext *pb, int entries)
                 av_log(c->fc, AV_LOG_ERROR, "Invalid sample rate %d\n", st->codecpar->sample_rate);
                 return AVERROR_INVALIDDATA;
             }
+            if (st->codecpar->channels < 0) {
+                av_log(c->fc, AV_LOG_ERROR, "Invalid channels %d\n", st->codecpar->channels);
+                return AVERROR_INVALIDDATA;
+            }
         } else if (st->codecpar->codec_type==AVMEDIA_TYPE_SUBTITLE){
             mov_parse_stsd_subtitle(c, pb, st, sc,
                                     size - (avio_tell(pb) - start_pos));
@@ -2655,8 +2679,10 @@ static int mov_read_stsc(MOVContext *c, AVIOContext *pb, MOVAtom atom)
 
     if (!entries)
         return 0;
-    if (sc->stsc_data)
-        av_log(c->fc, AV_LOG_WARNING, "Duplicated STSC atom\n");
+    if (sc->stsc_data) {
+        av_log(c->fc, AV_LOG_WARNING, "Ignoring duplicated STSC atom\n");
+        return 0;
+    }
     av_free(sc->stsc_data);
     sc->stsc_count = 0;
     sc->stsc_data = av_malloc_array(entries, sizeof(*sc->stsc_data));
@@ -3004,7 +3030,7 @@ static int mov_read_sdtp(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     av_freep(&sc->sdtp_data);
     sc->sdtp_count = 0;
 
-    sc->sdtp_data = av_mallocz(entries);
+    sc->sdtp_data = av_malloc(entries);
     if (!sc->sdtp_data)
         return AVERROR(ENOMEM);
 
@@ -3162,6 +3188,10 @@ static int get_edit_list_entry(MOVContext *mov,
     }
     *edit_list_duration = av_rescale(*edit_list_duration, msc->time_scale,
                                      global_timescale);
+
+    if (*edit_list_duration + (uint64_t)*edit_list_media_time > INT64_MAX)
+        *edit_list_duration = 0;
+
     return 1;
 }
 
@@ -3816,7 +3846,11 @@ static void mov_build_index(MOVContext *mov, AVStream *st)
         if ((empty_duration || start_time) && mov->time_scale > 0) {
             if (empty_duration)
                 empty_duration = av_rescale(empty_duration, sc->time_scale, mov->time_scale);
-            sc->time_offset = start_time - empty_duration;
+
+            if (av_sat_sub64(start_time, empty_duration) != start_time - (uint64_t)empty_duration)
+                av_log(mov->fc, AV_LOG_WARNING, "start_time - empty_duration is not representable\n");
+
+            sc->time_offset = start_time -  (uint64_t)empty_duration;
             sc->min_corrected_pts = start_time;
             if (!mov->advanced_editlist)
                 current_dts = -sc->time_offset;
@@ -3930,6 +3964,13 @@ static void mov_build_index(MOVContext *mov, AVStream *st)
                 if (keyframe)
                     distance = 0;
                 sample_size = sc->stsz_sample_size > 0 ? sc->stsz_sample_size : sc->sample_sizes[current_sample];
+                if (current_offset > INT64_MAX - sample_size) {
+                    av_log(mov->fc, AV_LOG_ERROR, "Current offset %"PRId64" or sample size %u is too large\n",
+                           current_offset,
+                           sample_size);
+                    return;
+                }
+
                 if (sc->pseudo_stream_id == -1 ||
                    sc->stsc_data[stsc_index].id - 1 == sc->pseudo_stream_id) {
                     AVIndexEntry *e;
@@ -4375,12 +4416,13 @@ static int mov_read_keys(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     for (i = 1; i <= count; ++i) {
         uint32_t key_size = avio_rb32(pb);
         uint32_t type = avio_rl32(pb);
-        if (key_size < 8) {
+        if (key_size < 8 || key_size > atom.size) {
             av_log(c->fc, AV_LOG_ERROR,
                    "The key# %"PRIu32" in meta has invalid size:"
                    "%"PRIu32"\n", i, key_size);
             return AVERROR_INVALIDDATA;
         }
+        atom.size -= key_size;
         key_size -= 8;
         if (type != MKTAG('m','d','t','a')) {
             avio_skip(pb, key_size);
@@ -4396,7 +4438,7 @@ static int mov_read_keys(MOVContext *c, AVIOContext *pb, MOVAtom atom)
 
 static int mov_read_custom(MOVContext *c, AVIOContext *pb, MOVAtom atom)
 {
-    int64_t end = avio_tell(pb) + atom.size;
+    int64_t end = av_sat_add64(avio_tell(pb), atom.size);
     uint8_t *key = NULL, *val = NULL, *mean = NULL;
     int i;
     int ret = 0;
@@ -4680,6 +4722,8 @@ static int mov_read_chap(MOVContext *c, AVIOContext *pb, MOVAtom atom)
 
     for (i = 0; i < num && !pb->eof_reached; i++)
         c->chapter_tracks[i] = avio_rb32(pb);
+
+    c->nb_chapter_tracks = i;
 
     return 0;
 }
@@ -4966,6 +5010,8 @@ static int mov_read_trun(MOVContext *c, AVIOContext *pb, MOVAtom atom)
                 "size %u, distance %d, keyframe %d\n", st->index,
                 index_entry_pos, offset, dts, sample_size, distance, keyframe);
         distance++;
+        if (av_sat_add64(dts, sample_duration) != dts + (uint64_t)sample_duration)
+            return AVERROR_INVALIDDATA;
         dts += sample_duration;
         offset += sample_size;
         sc->data_size += sample_size;
@@ -5082,6 +5128,8 @@ static int mov_read_sidx(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     avio_rb16(pb); // reserved
 
     item_count = avio_rb16(pb);
+    if (item_count == 0)
+        return AVERROR_INVALIDDATA;
 
     for (i = 0; i < item_count; i++) {
         int index;
@@ -5386,6 +5434,11 @@ static int mov_read_smdm(MOVContext *c, AVIOContext *pb, MOVAtom atom)
         av_log(c->fc, AV_LOG_WARNING, "Unsupported Mastering Display Metadata box version %d\n", version);
         return 0;
     }
+    if (sc->mastering) {
+        av_log(c->fc, AV_LOG_WARNING, "Ignoring duplicate Mastering Display Metadata\n");
+        return 0;
+    }
+
     avio_skip(pb, 3); /* flags */
 
     sc->mastering = av_mastering_display_metadata_alloc();
@@ -5424,6 +5477,11 @@ static int mov_read_mdcv(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     if (atom.size < 24) {
         av_log(c->fc, AV_LOG_ERROR, "Invalid Mastering Display Color Volume box\n");
         return AVERROR_INVALIDDATA;
+    }
+
+    if (sc->mastering) {
+        av_log(c->fc, AV_LOG_WARNING, "Ignoring duplicate Mastering Display Color Volume\n");
+        return 0;
     }
 
     sc->mastering = av_mastering_display_metadata_alloc();
@@ -5469,6 +5527,11 @@ static int mov_read_coll(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     }
     avio_skip(pb, 3); /* flags */
 
+    if (sc->coll){
+        av_log(c->fc, AV_LOG_WARNING, "Ignoring duplicate COLL\n");
+        return 0;
+    }
+
     sc->coll = av_content_light_metadata_alloc(&sc->coll_size);
     if (!sc->coll)
         return AVERROR(ENOMEM);
@@ -5491,6 +5554,11 @@ static int mov_read_clli(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     if (atom.size < 4) {
         av_log(c->fc, AV_LOG_ERROR, "Empty Content Light Level Info box\n");
         return AVERROR_INVALIDDATA;
+    }
+
+    if (sc->coll){
+        av_log(c->fc, AV_LOG_WARNING, "Ignoring duplicate CLLI/COLL\n");
+        return 0;
     }
 
     sc->coll = av_content_light_metadata_alloc(&sc->coll_size);
@@ -5520,6 +5588,10 @@ static int mov_read_st3d(MOVContext *c, AVIOContext *pb, MOVAtom atom)
         av_log(c->fc, AV_LOG_ERROR, "Empty stereoscopic video box\n");
         return AVERROR_INVALIDDATA;
     }
+
+    if (sc->stereo3d)
+        return AVERROR_INVALIDDATA;
+
     avio_skip(pb, 4); /* version + flags */
 
     mode = avio_r8(pb);
@@ -6069,6 +6141,8 @@ static int mov_read_senc(MOVContext *c, AVIOContext *pb, MOVAtom atom)
         }
         if (pb->eof_reached) {
             av_log(c->fc, AV_LOG_ERROR, "Hit EOF while reading senc\n");
+            if (ret >= 0)
+                av_encryption_info_free(encryption_index->encrypted_samples[i]);
             ret = AVERROR_INVALIDDATA;
         }
 
@@ -6980,6 +7054,8 @@ static int mov_read_default(MOVContext *c, AVIOContext *pb, MOVAtom atom)
                 uint32_t type;
                 avio_skip(pb, 4);
                 type = avio_rl32(pb);
+                if (avio_feof(pb))
+                    break;
                 avio_seek(pb, -8, SEEK_CUR);
                 if (type == MKTAG('m','v','h','d') ||
                     type == MKTAG('c','m','o','v')) {
@@ -7009,6 +7085,8 @@ static int mov_read_default(MOVContext *c, AVIOContext *pb, MOVAtom atom)
         if (a.size == 0) {
             a.size = atom.size - total_size + 8;
         }
+        if (a.size < 0)
+            break;
         a.size -= 8;
         if (a.size < 0)
             break;
@@ -7044,7 +7122,7 @@ static int mov_read_default(MOVContext *c, AVIOContext *pb, MOVAtom atom)
                 c->atom_depth --;
                 return err;
             }
-            if (c->found_moov && c->found_mdat &&
+            if (c->found_moov && c->found_mdat && a.size <= INT64_MAX - start_pos &&
                 ((!(pb->seekable & AVIO_SEEKABLE_NORMAL) || c->fc->flags & AVFMT_FLAG_IGNIDX || c->frag_index.complete) ||
                  start_pos + a.size == avio_size(pb))) {
                 if (!(pb->seekable & AVIO_SEEKABLE_NORMAL) || c->fc->flags & AVFMT_FLAG_IGNIDX || c->frag_index.complete)
@@ -7775,12 +7853,13 @@ static AVIndexEntry *mov_find_next_sample(AVFormatContext *s, AVStream **st)
         if (msc->pb && msc->current_sample < avst->nb_index_entries) {
             AVIndexEntry *current_sample = &avst->index_entries[msc->current_sample];
             int64_t dts = av_rescale(current_sample->timestamp, AV_TIME_BASE, msc->time_scale);
+            uint64_t dtsdiff = best_dts > dts ? best_dts - (uint64_t)dts : ((uint64_t)dts - best_dts);
             av_log(s, AV_LOG_TRACE, "stream %d, sample %d, dts %"PRId64"\n", i, msc->current_sample, dts);
             if (!sample || (!(s->pb->seekable & AVIO_SEEKABLE_NORMAL) && current_sample->pos < sample->pos) ||
                 ((s->pb->seekable & AVIO_SEEKABLE_NORMAL) &&
                  ((msc->pb != s->pb && dts < best_dts) || (msc->pb == s->pb && dts != AV_NOPTS_VALUE &&
-                 ((FFABS(best_dts - dts) <= AV_TIME_BASE && current_sample->pos < sample->pos) ||
-                  (FFABS(best_dts - dts) > AV_TIME_BASE && dts < best_dts)))))) {
+                 ((dtsdiff <= AV_TIME_BASE && current_sample->pos < sample->pos) ||
+                  (dtsdiff > AV_TIME_BASE && dts < best_dts)))))) {
                 sample = current_sample;
                 best_dts = dts;
                 *st = avst;
@@ -7943,7 +8022,7 @@ static int mov_read_packet(AVFormatContext *s, AVPacket *pkt)
         pkt->flags |= AV_PKT_FLAG_DISCARD;
     }
     if (sc->ctts_data && sc->ctts_index < sc->ctts_count) {
-        pkt->pts = pkt->dts + sc->dts_shift + sc->ctts_data[sc->ctts_index].duration;
+        pkt->pts = av_sat_add64(pkt->dts, av_sat_add64(sc->dts_shift, sc->ctts_data[sc->ctts_index].duration));
         /* update ctts context */
         sc->ctts_sample++;
         if (sc->ctts_index < sc->ctts_count &&

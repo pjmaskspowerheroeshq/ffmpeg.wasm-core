@@ -1079,6 +1079,10 @@ static int ljpeg_decode_rgb_scan(MJpegDecodeContext *s, int nb_components, int p
         return AVERROR_INVALIDDATA;
     if (s->v_max != 1 || s->h_max != 1 || !s->lossless)
         return AVERROR_INVALIDDATA;
+    if (s->bayer) {
+        if (s->rct || s->pegasus_rct)
+            return AVERROR_INVALIDDATA;
+    }
 
 
     s->restart_count = s->restart_interval;
@@ -1195,6 +1199,8 @@ static int ljpeg_decode_rgb_scan(MJpegDecodeContext *s, int nb_components, int p
                 ptr[3*mb_x + 2] = buffer[mb_x][2] + ptr[3*mb_x + 1];
             }
         } else if (s->bayer) {
+            if (s->bits <= 8)
+                return AVERROR_PATCHWELCOME;
             if (nb_components == 1) {
                 /* Leave decoding to the TIFF/DNG decoder (see comment in ff_mjpeg_decode_sof) */
                 for (mb_x = 0; mb_x < width; mb_x++)
@@ -1570,6 +1576,9 @@ static int mjpeg_decode_scan_progressive_ac(MJpegDecodeContext *s, int ss,
                 else
                     ret = decode_block_progressive(s, *block, last_nnz, s->ac_index[0],
                                                    quant_matrix, ss, se, Al, &EOBRUN);
+
+                if (ret >= 0 && get_bits_left(&s->gb) < 0)
+                    ret = AVERROR_INVALIDDATA;
                 if (ret < 0) {
                     av_log(s->avctx, AV_LOG_ERROR,
                            "error y=%d x=%d\n", mb_y, mb_x);
@@ -1926,6 +1935,8 @@ static int mjpeg_decode_app(MJpegDecodeContext *s)
         }
 
         len -= 9;
+        if (s->bayer)
+            goto out;
         if (s->got_picture)
             if (rgb != s->rgb || pegasus_rct != s->pegasus_rct) {
                 av_log(s->avctx, AV_LOG_WARNING, "Mismatching LJIF tag\n");
@@ -2803,6 +2814,8 @@ the_end_no_picture:
     return buf_ptr - buf;
 }
 
+/* mxpeg may call the following function (with a blank MJpegDecodeContext)
+ * even without having called ff_mjpeg_decode_init(). */
 av_cold int ff_mjpeg_decode_end(AVCodecContext *avctx)
 {
     MJpegDecodeContext *s = avctx->priv_data;
@@ -2876,7 +2889,7 @@ AVCodec ff_mjpeg_decoder = {
     .max_lowres     = 3,
     .priv_class     = &mjpegdec_class,
     .profiles       = NULL_IF_CONFIG_SMALL(ff_mjpeg_profiles),
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE |
+    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE | FF_CODEC_CAP_INIT_CLEANUP |
                       FF_CODEC_CAP_SKIP_FRAME_FILL_PARAM,
     .hw_configs     = (const AVCodecHWConfigInternal*[]) {
 #if CONFIG_MJPEG_NVDEC_HWACCEL
@@ -2902,6 +2915,6 @@ AVCodec ff_thp_decoder = {
     .flush          = decode_flush,
     .capabilities   = AV_CODEC_CAP_DR1,
     .max_lowres     = 3,
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE,
+    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE | FF_CODEC_CAP_INIT_CLEANUP,
 };
 #endif

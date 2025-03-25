@@ -125,33 +125,46 @@ static const char *read_ts(JACOsubContext *jacosub, const char *buf,
     return NULL;
 
 shift_and_ret:
-    ts_start64  = (ts_start + jacosub->shift) * 100LL / jacosub->timeres;
-    ts_end64    = (ts_end   + jacosub->shift) * 100LL / jacosub->timeres;
+    ts_start64  = (ts_start + (int64_t)jacosub->shift) * 100LL / jacosub->timeres;
+    ts_end64    = (ts_end   + (int64_t)jacosub->shift) * 100LL / jacosub->timeres;
     *start    = ts_start64;
     *duration = ts_end64 - ts_start64;
     return buf + len;
 }
 
-static int get_shift(int timeres, const char *buf)
+static int get_shift(unsigned timeres, const char *buf)
 {
     int sign = 1;
-    int a = 0, b = 0, c = 0, d = 0;
+    int h = 0, m = 0, s = 0, d = 0;
+    int64_t ret;
 #define SSEP "%*1[.:]"
-    int n = sscanf(buf, "%d"SSEP"%d"SSEP"%d"SSEP"%d", &a, &b, &c, &d);
+    int n = sscanf(buf, "%d"SSEP"%d"SSEP"%d"SSEP"%d", &h, &m, &s, &d);
 #undef SSEP
 
-    if (*buf == '-' || a < 0) {
+    if (h == INT_MIN)
+        return 0;
+
+    if (*buf == '-' || h < 0) {
         sign = -1;
-        a = FFABS(a);
+        h = FFABS(h);
     }
 
+    ret = 0;
     switch (n) {
-    case 4: return sign * ((a*3600 + b*60 + c) * timeres + d);
-    case 3: return sign * ((         a*60 + b) * timeres + c);
-    case 2: return sign * ((                a) * timeres + b);
+    case 1:        h = 0;                   //clear all in case of a single parameter
+    case 2: s = m; m = h; h = 0;            //shift into second subsecondd
+    case 3: d = s; s = m; m = h; h = 0;     //shift into minute second subsecond
     }
 
-    return 0;
+    ret = (int64_t)h*3600 + (int64_t)m*60 + s;
+    if (FFABS(ret) > (INT64_MAX - FFABS((int64_t)d)) / timeres)
+        return 0;
+    ret = sign * (ret * timeres + d);
+
+    if ((int)ret != ret)
+        ret = 0;
+
+    return ret;
 }
 
 static int jacosub_read_header(AVFormatContext *s)
@@ -222,13 +235,16 @@ static int jacosub_read_header(AVFormatContext *s)
             }
             av_bprintf(&header, "#S %s", p);
             break;
-        case 'T': // ...but must be placed after TIMERES
-            jacosub->timeres = strtol(p, NULL, 10);
-            if (!jacosub->timeres)
+        case 'T': { // ...but must be placed after TIMERES
+            int64_t timeres = strtol(p, NULL, 10);
+            if (timeres <= 0 || timeres > UINT32_MAX) {
                 jacosub->timeres = 30;
-            else
+            } else {
+                jacosub->timeres = timeres;
                 av_bprintf(&header, "#T %s", p);
+            }
             break;
+        }
         }
     }
 

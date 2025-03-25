@@ -778,20 +778,22 @@ static int matroska_read_close(AVFormatContext *s);
 static int matroska_reset_status(MatroskaDemuxContext *matroska,
                                  uint32_t id, int64_t position)
 {
+    int64_t err = 0;
     if (position >= 0) {
-        int64_t err = avio_seek(matroska->ctx->pb, position, SEEK_SET);
-        if (err < 0)
-            return err;
-    }
+        err = avio_seek(matroska->ctx->pb, position, SEEK_SET);
+        if (err > 0)
+            err = 0;
+    } else
+        position = avio_tell(matroska->ctx->pb);
 
     matroska->current_id    = id;
     matroska->num_levels    = 1;
     matroska->unknown_count = 0;
-    matroska->resync_pos = avio_tell(matroska->ctx->pb);
+    matroska->resync_pos    = position;
     if (id)
         matroska->resync_pos -= (av_log2(id) + 7) / 8;
 
-    return 0;
+    return err;
 }
 
 static int matroska_resync(MatroskaDemuxContext *matroska, int64_t last_pos)
@@ -1641,7 +1643,7 @@ static int matroska_decode_buffer(uint8_t **buf, int *buf_size,
     case MATROSKA_TRACK_ENCODING_COMP_ZLIB:
     {
         z_stream zstream = { 0 };
-        if (inflateInit(&zstream) != Z_OK)
+        if (!pkt_size || inflateInit(&zstream) != Z_OK)
             return -1;
         zstream.next_in  = data;
         zstream.avail_in = isize;
@@ -1674,7 +1676,7 @@ static int matroska_decode_buffer(uint8_t **buf, int *buf_size,
     case MATROSKA_TRACK_ENCODING_COMP_BZLIB:
     {
         bz_stream bzstream = { 0 };
-        if (BZ2_bzDecompressInit(&bzstream, 0, 0) != BZ_OK)
+        if (!pkt_size || BZ2_bzDecompressInit(&bzstream, 0, 0) != BZ_OK)
             return -1;
         bzstream.next_in  = data;
         bzstream.avail_in = isize;
@@ -1824,6 +1826,7 @@ static int matroska_parse_seekhead_entry(MatroskaDemuxContext *matroska,
     uint32_t saved_id  = matroska->current_id;
     int64_t before_pos = avio_tell(matroska->ctx->pb);
     int ret = 0;
+    int ret2;
 
     /* seek */
     if (avio_seek(matroska->ctx->pb, pos, SEEK_SET) == pos) {
@@ -1848,7 +1851,9 @@ static int matroska_parse_seekhead_entry(MatroskaDemuxContext *matroska,
     }
     /* Seek back - notice that in all instances where this is used
      * it is safe to set the level to 1. */
-    matroska_reset_status(matroska, saved_id, before_pos);
+    ret2 = matroska_reset_status(matroska, saved_id, before_pos);
+    if (ret >= 0)
+        ret = ret2;
 
     return ret;
 }
@@ -2162,30 +2167,26 @@ static int mkv_parse_video_projection(AVStream *st, const MatroskaTrack *track,
                                       void *logctx)
 {
     AVSphericalMapping *spherical;
+    const MatroskaTrackVideoProjection *mkv_projection = &track->video.projection;
+    const uint8_t *priv_data = mkv_projection->private.data;
     enum AVSphericalProjection projection;
     size_t spherical_size;
     uint32_t l = 0, t = 0, r = 0, b = 0;
     uint32_t padding = 0;
     int ret;
-    GetByteContext gb;
 
-    bytestream2_init(&gb, track->video.projection.private.data,
-                     track->video.projection.private.size);
-
-    if (bytestream2_get_byte(&gb) != 0) {
+    if (mkv_projection->private.size && priv_data[0] != 0) {
         av_log(logctx, AV_LOG_WARNING, "Unknown spherical metadata\n");
         return 0;
     }
 
-    bytestream2_skip(&gb, 3); // flags
-
     switch (track->video.projection.type) {
     case MATROSKA_VIDEO_PROJECTION_TYPE_EQUIRECTANGULAR:
         if (track->video.projection.private.size == 20) {
-            t = bytestream2_get_be32(&gb);
-            b = bytestream2_get_be32(&gb);
-            l = bytestream2_get_be32(&gb);
-            r = bytestream2_get_be32(&gb);
+            t = AV_RB32(priv_data +  4);
+            b = AV_RB32(priv_data +  8);
+            l = AV_RB32(priv_data + 12);
+            r = AV_RB32(priv_data + 16);
 
             if (b >= UINT_MAX - t || r >= UINT_MAX - l) {
                 av_log(logctx, AV_LOG_ERROR,
@@ -2209,14 +2210,14 @@ static int mkv_parse_video_projection(AVStream *st, const MatroskaTrack *track,
             av_log(logctx, AV_LOG_ERROR, "Missing projection private properties\n");
             return AVERROR_INVALIDDATA;
         } else if (track->video.projection.private.size == 12) {
-            uint32_t layout = bytestream2_get_be32(&gb);
+            uint32_t layout = AV_RB32(priv_data + 4);
             if (layout) {
                 av_log(logctx, AV_LOG_WARNING,
                        "Unknown spherical cubemap layout %"PRIu32"\n", layout);
                 return 0;
             }
             projection = AV_SPHERICAL_CUBEMAP;
-            padding = bytestream2_get_be32(&gb);
+            padding = AV_RB32(priv_data + 8);
         } else {
             av_log(logctx, AV_LOG_ERROR, "Unknown spherical metadata\n");
             return AVERROR_INVALIDDATA;
@@ -2320,6 +2321,15 @@ static int matroska_parse_tracks(AVFormatContext *s)
         }
         if (!track->codec_id)
             continue;
+
+        if (   track->type == MATROSKA_TRACK_TYPE_AUDIO && track->codec_id[0] != 'A'
+            || track->type == MATROSKA_TRACK_TYPE_VIDEO && track->codec_id[0] != 'V'
+            || track->type == MATROSKA_TRACK_TYPE_SUBTITLE && track->codec_id[0] != 'D' && track->codec_id[0] != 'S'
+            || track->type == MATROSKA_TRACK_TYPE_METADATA && track->codec_id[0] != 'D' && track->codec_id[0] != 'S'
+        ) {
+            av_log(matroska->ctx, AV_LOG_INFO, "Inconsistent track type\n");
+            continue;
+        }
 
         if (track->audio.samplerate < 0 || track->audio.samplerate > INT_MAX ||
             isnan(track->audio.samplerate)) {
@@ -2677,6 +2687,10 @@ static int matroska_parse_tracks(AVFormatContext *s)
 
         if (track->time_scale < 0.01)
             track->time_scale = 1.0;
+
+        if (matroska->time_scale * track->time_scale > UINT_MAX)
+            return AVERROR_INVALIDDATA;
+
         avpriv_set_pts_info(st, 64, matroska->time_scale * track->time_scale,
                             1000 * 1000 * 1000);    /* 64 bit pts in ns */
 
@@ -2740,8 +2754,9 @@ static int matroska_parse_tracks(AVFormatContext *s)
                 st->need_parsing = AVSTREAM_PARSE_HEADERS;
 
             if (track->default_duration) {
+                int div = track->default_duration <= INT64_MAX ? 1 : 2;
                 av_reduce(&st->avg_frame_rate.num, &st->avg_frame_rate.den,
-                          1000000000, track->default_duration, 30000);
+                          1000000000 / div, track->default_duration / div, 30000);
 #if FF_API_R_FRAME_RATE
                 if (   st->avg_frame_rate.num < st->avg_frame_rate.den * 1000LL
                     && st->avg_frame_rate.num > st->avg_frame_rate.den * 5LL)
@@ -2885,6 +2900,8 @@ static int matroska_read_header(AVFormatContext *s)
             goto fail;
         pos = avio_tell(matroska->ctx->pb);
         res = ebml_parse(matroska, matroska_segment, matroska);
+        if (res == AVERROR(EIO)) // EOF is translated to EIO, this exists the loop on EOF
+            goto fail;
     }
     /* Set data_offset as it might be needed later by seek_frame_generic. */
     if (matroska->current_id == MATROSKA_ID_CLUSTER)
@@ -2893,6 +2910,8 @@ static int matroska_read_header(AVFormatContext *s)
 
     if (!matroska->time_scale)
         matroska->time_scale = 1000000;
+    if (isnan(matroska->duration))
+        matroska->duration = 0;
     if (matroska->duration)
         matroska->ctx->duration = matroska->duration * matroska->time_scale *
                                   1000 / AV_TIME_BASE;
@@ -3685,7 +3704,7 @@ static int matroska_parse_cluster(MatroskaDemuxContext *matroska)
     MatroskaBlock     *block = &cluster->block;
     int res;
 
-    av_assert0(matroska->num_levels <= 2);
+    av_assert0(matroska->num_levels <= 2U);
 
     if (matroska->num_levels == 1) {
         res = ebml_parse(matroska, matroska_segment, NULL);
@@ -3852,7 +3871,9 @@ static CueDesc get_cue_desc(AVFormatContext *s, int64_t ts, int64_t cues_start) 
     int i;
     int nb_index_entries = s->streams[0]->nb_index_entries;
     AVIndexEntry *index_entries = s->streams[0]->index_entries;
-    if (ts >= matroska->duration * matroska->time_scale) return (CueDesc) {-1, -1, -1, -1};
+
+    if (ts >= (int64_t)(matroska->duration * matroska->time_scale))
+        return (CueDesc) {-1, -1, -1, -1};
     for (i = 1; i < nb_index_entries; i++) {
         if (index_entries[i - 1].timestamp * matroska->time_scale <= ts &&
             index_entries[i].timestamp * matroska->time_scale > ts) {
@@ -4013,15 +4034,18 @@ static int64_t webm_dash_manifest_compute_bandwidth(AVFormatContext *s, int64_t 
         int64_t prebuffer_ns = 1000000000;
         int64_t time_ns = st->index_entries[i].timestamp * matroska->time_scale;
         double nano_seconds_per_second = 1000000000.0;
-        int64_t prebuffered_ns = time_ns + prebuffer_ns;
+        int64_t prebuffered_ns;
         double prebuffer_bytes = 0.0;
         int64_t temp_prebuffer_ns = prebuffer_ns;
         int64_t pre_bytes, pre_ns;
         double pre_sec, prebuffer, bits_per_second;
         CueDesc desc_beg = get_cue_desc(s, time_ns, cues_start);
-
         // Start with the first Cue.
         CueDesc desc_end = desc_beg;
+
+        if (time_ns > INT64_MAX - prebuffer_ns)
+            return -1;
+        prebuffered_ns = time_ns + prebuffer_ns;
 
         // Figure out how much data we have downloaded for the prebuffer. This will
         // be used later to adjust the bits per sample to try.
@@ -4040,6 +4064,9 @@ static int64_t webm_dash_manifest_compute_bandwidth(AVFormatContext *s, int64_t 
             // The prebuffer ends in the last Cue. Estimate how much data was
             // prebuffered.
             pre_bytes = desc_end.end_offset - desc_end.start_offset;
+            if (desc_end.end_time_ns <= desc_end.start_time_ns ||
+                desc_end.end_time_ns - (uint64_t)desc_end.start_time_ns > INT64_MAX)
+                return -1;
             pre_ns = desc_end.end_time_ns - desc_end.start_time_ns;
             pre_sec = pre_ns / nano_seconds_per_second;
             prebuffer_bytes +=
@@ -4052,12 +4079,16 @@ static int64_t webm_dash_manifest_compute_bandwidth(AVFormatContext *s, int64_t 
             do {
                 int64_t desc_bytes = desc_end.end_offset - desc_beg.start_offset;
                 int64_t desc_ns = desc_end.end_time_ns - desc_beg.start_time_ns;
-                double desc_sec = desc_ns / nano_seconds_per_second;
-                double calc_bits_per_second = (desc_bytes * 8) / desc_sec;
+                double desc_sec, calc_bits_per_second, percent, mod_bits_per_second;
+                if (desc_bytes <= 0 || desc_bytes > INT64_MAX/8)
+                    return -1;
+
+                desc_sec = desc_ns / nano_seconds_per_second;
+                calc_bits_per_second = (desc_bytes * 8) / desc_sec;
 
                 // Drop the bps by the percentage of bytes buffered.
-                double percent = (desc_bytes - prebuffer_bytes) / desc_bytes;
-                double mod_bits_per_second = calc_bits_per_second * percent;
+                percent = (desc_bytes - prebuffer_bytes) / desc_bytes;
+                mod_bits_per_second = calc_bits_per_second * percent;
 
                 if (prebuffer < desc_sec) {
                     double search_sec =

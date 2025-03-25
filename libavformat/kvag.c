@@ -31,7 +31,7 @@
 typedef struct KVAGHeader {
     uint32_t    magic;
     uint32_t    data_size;
-    uint32_t    sample_rate;
+    int    sample_rate;
     uint16_t    stereo;
 } KVAGHeader;
 
@@ -65,6 +65,9 @@ static int kvag_read_header(AVFormatContext *s)
     hdr.sample_rate             = AV_RL32(buf +  8);
     hdr.stereo                  = AV_RL16(buf + 12);
 
+    if (hdr.sample_rate <= 0)
+        return AVERROR_INVALIDDATA;
+
     par                         = st->codecpar;
     par->codec_type             = AVMEDIA_TYPE_AUDIO;
     par->codec_id               = AV_CODEC_ID_ADPCM_IMA_SSI;
@@ -83,7 +86,7 @@ static int kvag_read_header(AVFormatContext *s)
     par->bits_per_raw_sample    = 16;
     par->block_align            = 1;
     par->bit_rate               = par->channels *
-                                  par->sample_rate *
+                                  (uint64_t)par->sample_rate *
                                   par->bits_per_coded_sample;
 
     avpriv_set_pts_info(st, 64, 1, par->sample_rate);

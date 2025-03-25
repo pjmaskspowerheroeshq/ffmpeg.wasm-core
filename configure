@@ -7,9 +7,6 @@
 # Copyright (c) 2005-2008 Mans Rullgard
 #
 
-# Set PKG_CONFIG_PATH manually
-export PKG_CONFIG_PATH=$PWD/build/lib/pkgconfig
-
 # Prevent locale nonsense from breaking basic text processing.
 LC_ALL=C
 export LC_ALL
@@ -535,7 +532,7 @@ die(){
 
 If you think configure made a mistake, make sure you are using the latest
 version from Git.  If the latest version fails, report the problem to the
-ffmpeg-user@ffmpeg.org mailing list or IRC #ffmpeg on irc.freenode.net.
+ffmpeg-user@ffmpeg.org mailing list or IRC #ffmpeg on irc.libera.chat.
 EOF
     if disabled logging; then
         cat <<EOF
@@ -2333,6 +2330,7 @@ HAVE_LIST="
     opencl_vaapi_intel_media
     perl
     pod2man
+    posix_ioctl
     texi2html
 "
 
@@ -3239,7 +3237,7 @@ librav1e_encoder_deps="librav1e"
 librav1e_encoder_select="extract_extradata_bsf"
 librsvg_decoder_deps="librsvg"
 libshine_encoder_deps="libshine"
-libshine_encoder_select="audio_frame_queue"
+libshine_encoder_select="audio_frame_queue mpegaudioheader"
 libspeex_decoder_deps="libspeex"
 libspeex_encoder_deps="libspeex"
 libspeex_encoder_select="audio_frame_queue"
@@ -5333,6 +5331,7 @@ case $target_os in
         ;;
     netbsd)
         disable symver
+        enable section_data_rel_ro
         oss_indev_extralibs="-lossaudio"
         oss_outdev_extralibs="-lossaudio"
         enabled gcc || check_ldflags -Wl,-zmuldefs
@@ -5351,6 +5350,7 @@ case $target_os in
         disable symver
         ;;
     freebsd)
+        enable section_data_rel_ro
         ;;
     bsd/os)
         add_extralibs -lpoll -lgnugetopt
@@ -6496,7 +6496,7 @@ fi
 
 if enabled sdl2; then
     SDL2_CONFIG="${cross_prefix}sdl2-config"
-    test_pkg_config sdl2 "sdl2 >= 2.0.1 sdl2 < 2.1.0" SDL_events.h SDL_PollEvent
+    test_pkg_config sdl2 "sdl2 >= 2.0.1 sdl2 < 3.0.0" SDL_events.h SDL_PollEvent
     if disabled sdl2 && "${SDL2_CONFIG}" --version > /dev/null 2>&1; then
         sdl2_cflags=$("${SDL2_CONFIG}" --cflags)
         sdl2_extralibs=$("${SDL2_CONFIG}" --libs)
@@ -6542,11 +6542,13 @@ perl -v            > /dev/null 2>&1 && enable perl      || disable perl
 pod2man --help     > /dev/null 2>&1 && enable pod2man   || disable pod2man
 rsync --help 2> /dev/null | grep -q 'contimeout' && enable rsync_contimeout || disable rsync_contimeout
 
+check_headers linux/fb.h
+check_headers linux/videodev2.h
+test_code cc linux/videodev2.h "struct v4l2_frmsizeenum vfse; vfse.discrete.width = 0;" && enable_sanitized struct_v4l2_frmivalenum_discrete
+test_code cc sys/ioctl.h "int ioctl(int, int, ...)" && enable posix_ioctl
+
 # check V4L2 codecs available in the API
 if enabled v4l2_m2m; then
-    check_headers linux/fb.h
-    check_headers linux/videodev2.h
-    test_code cc linux/videodev2.h "struct v4l2_frmsizeenum vfse; vfse.discrete.width = 0;" && enable_sanitized struct_v4l2_frmivalenum_discrete
     check_cc v4l2_m2m linux/videodev2.h "int i = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_VIDEO_M2M | V4L2_BUF_FLAG_LAST;"
     check_cc vc1_v4l2_m2m linux/videodev2.h "int i = V4L2_PIX_FMT_VC1_ANNEX_G;"
     check_cc mpeg1_v4l2_m2m linux/videodev2.h "int i = V4L2_PIX_FMT_MPEG1;"
@@ -6591,7 +6593,7 @@ enabled alsa && { check_pkg_config alsa alsa "alsa/asoundlib.h" snd_pcm_htimesta
 enabled libjack &&
     require_pkg_config libjack jack jack/jack.h jack_port_get_latency_range
 
-enabled sndio && check_lib sndio sndio.h sio_open -lsndio
+enabled sndio && check_pkg_config sndio sndio sndio.h sio_open
 
 if enabled libcdio; then
     check_pkg_config libcdio libcdio_paranoia "cdio/cdda.h cdio/paranoia.h" cdio_cddap_open ||
@@ -6688,7 +6690,7 @@ enabled vulkan &&
 
 if enabled x86; then
     case $target_os in
-        mingw32*|mingw64*|win32|win64|linux|cygwin*)
+        freebsd|mingw32*|mingw64*|win32|win64|linux|cygwin*)
             ;;
         *)
             disable ffnvcodec cuvid nvdec nvenc
@@ -7516,7 +7518,7 @@ cat > $TMPH <<EOF
 #define FFMPEG_CONFIG_H
 #define FFMPEG_CONFIGURATION "$(c_escape $FFMPEG_CONFIGURATION)"
 #define FFMPEG_LICENSE "$(c_escape $license)"
-#define CONFIG_THIS_YEAR 2020
+#define CONFIG_THIS_YEAR 2025
 #define FFMPEG_DATADIR "$(eval c_escape $datadir)"
 #define AVCONV_DATADIR "$(eval c_escape $datadir)"
 #define CC_IDENT "$(c_escape ${cc_ident:-Unknown compiler})"

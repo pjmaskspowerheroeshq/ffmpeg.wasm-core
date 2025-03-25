@@ -492,9 +492,13 @@ FF_ENABLE_DEPRECATION_WARNINGS
     if (!s->fixed_qscale &&
         avctx->bit_rate * av_q2d(avctx->time_base) >
             avctx->bit_rate_tolerance) {
+        double nbt = avctx->bit_rate * av_q2d(avctx->time_base) * 5;
         av_log(avctx, AV_LOG_WARNING,
                "bitrate tolerance %d too small for bitrate %"PRId64", overriding\n", avctx->bit_rate_tolerance, avctx->bit_rate);
-        avctx->bit_rate_tolerance = 5 * avctx->bit_rate * av_q2d(avctx->time_base);
+        if (nbt <= INT_MAX) {
+            avctx->bit_rate_tolerance = nbt;
+        } else
+            avctx->bit_rate_tolerance = INT_MAX;
     }
 
     if (s->avctx->rc_max_rate &&
@@ -556,6 +560,12 @@ FF_ENABLE_DEPRECATION_WARNINGS
         (avctx->width  > 2048 ||
          avctx->height > 1152 )) {
         av_log(avctx, AV_LOG_ERROR, "H.263 does not support resolutions above 2048x1152\n");
+        return AVERROR(EINVAL);
+    }
+    if (s->codec_id == AV_CODEC_ID_FLV1 &&
+        (avctx->width  > 65535 ||
+         avctx->height > 65535 )) {
+        av_log(avctx, AV_LOG_ERROR, "FLV does not support resolutions above 16bit\n");
         return AVERROR(EINVAL);
     }
     if ((s->codec_id == AV_CODEC_ID_H263  ||
@@ -1061,6 +1071,7 @@ FF_ENABLE_DEPRECATION_WARNINGS
 
     return 0;
 fail:
+    ff_mpv_encode_end(avctx);
     return AVERROR_UNKNOWN;
 }
 
@@ -1230,12 +1241,12 @@ static int load_input_picture(MpegEncContext *s, const AVFrame *pic_arg)
                                                  &v_chroma_shift);
 
                 for (i = 0; i < 3; i++) {
-                    int src_stride = pic_arg->linesize[i];
-                    int dst_stride = i ? s->uvlinesize : s->linesize;
+                    ptrdiff_t src_stride = pic_arg->linesize[i];
+                    ptrdiff_t dst_stride = i ? s->uvlinesize : s->linesize;
                     int h_shift = i ? h_chroma_shift : 0;
                     int v_shift = i ? v_chroma_shift : 0;
-                    int w = s->width  >> h_shift;
-                    int h = s->height >> v_shift;
+                    int w = AV_CEIL_RSHIFT(s->width , h_shift);
+                    int h = AV_CEIL_RSHIFT(s->height, v_shift);
                     uint8_t *src = pic_arg->data[i];
                     uint8_t *dst = pic->f->data[i];
                     int vpad = 16;
@@ -1249,7 +1260,7 @@ static int load_input_picture(MpegEncContext *s, const AVFrame *pic_arg)
                         dst += INPLACE_OFFSET;
 
                     if (src_stride == dst_stride)
-                        memcpy(dst, src, src_stride * h);
+                        memcpy(dst, src, src_stride * h - src_stride + w);
                     else {
                         int h2 = h;
                         uint8_t *dst2 = dst;
@@ -1292,6 +1303,8 @@ static int load_input_picture(MpegEncContext *s, const AVFrame *pic_arg)
     /* shift buffer entries */
     for (i = flush_offset; i < MAX_PICTURE_COUNT /*s->encoding_delay + 1*/; i++)
         s->input_picture[i - flush_offset] = s->input_picture[i];
+    for (int i = MAX_B_FRAMES + 1 - flush_offset; i <= MAX_B_FRAMES; i++)
+        s->input_picture[i] = NULL;
 
     s->input_picture[encoding_delay] = (Picture*) pic;
 
@@ -1470,7 +1483,7 @@ static int estimate_best_b_count(MpegEncContext *s)
                 goto fail;
             }
 
-            rd += (out_size * lambda2) >> (FF_LAMBDA_SHIFT - 3);
+            rd += (out_size * (uint64_t)lambda2) >> (FF_LAMBDA_SHIFT - 3);
         }
 
         /* get the delayed frames */
@@ -1479,7 +1492,7 @@ static int estimate_best_b_count(MpegEncContext *s)
             ret = out_size;
             goto fail;
         }
-        rd += (out_size * lambda2) >> (FF_LAMBDA_SHIFT - 3);
+        rd += (out_size * (uint64_t)lambda2) >> (FF_LAMBDA_SHIFT - 3);
 
         rd += c->error[0] + c->error[1] + c->error[2];
 
@@ -4743,7 +4756,6 @@ AVCodec ff_h263_encoder = {
     .init           = ff_mpv_encode_init,
     .encode2        = ff_mpv_encode_picture,
     .close          = ff_mpv_encode_end,
-    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
     .pix_fmts= (const enum AVPixelFormat[]){AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE},
     .priv_class     = &h263_class,
 };
@@ -4773,7 +4785,6 @@ AVCodec ff_h263p_encoder = {
     .encode2        = ff_mpv_encode_picture,
     .close          = ff_mpv_encode_end,
     .capabilities   = AV_CODEC_CAP_SLICE_THREADS,
-    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
     .pix_fmts       = (const enum AVPixelFormat[]){ AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE },
     .priv_class     = &h263p_class,
 };
@@ -4794,7 +4805,6 @@ AVCodec ff_msmpeg4v2_encoder = {
     .init           = ff_mpv_encode_init,
     .encode2        = ff_mpv_encode_picture,
     .close          = ff_mpv_encode_end,
-    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
     .pix_fmts       = (const enum AVPixelFormat[]){ AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE },
     .priv_class     = &msmpeg4v2_class,
 };
@@ -4815,7 +4825,6 @@ AVCodec ff_msmpeg4v3_encoder = {
     .init           = ff_mpv_encode_init,
     .encode2        = ff_mpv_encode_picture,
     .close          = ff_mpv_encode_end,
-    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
     .pix_fmts       = (const enum AVPixelFormat[]){ AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE },
     .priv_class     = &msmpeg4v3_class,
 };
@@ -4836,7 +4845,6 @@ AVCodec ff_wmv1_encoder = {
     .init           = ff_mpv_encode_init,
     .encode2        = ff_mpv_encode_picture,
     .close          = ff_mpv_encode_end,
-    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
     .pix_fmts       = (const enum AVPixelFormat[]){ AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE },
     .priv_class     = &wmv1_class,
 };

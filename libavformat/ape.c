@@ -42,8 +42,8 @@
 
 typedef struct APEFrame {
     int64_t pos;
+    int64_t size;
     int nblocks;
-    int size;
     int skip;
     int64_t pts;
 } APEFrame;
@@ -148,7 +148,7 @@ static void ape_dumpinfo(AVFormatContext * s, APEContext * ape_ctx)
 
     av_log(s, AV_LOG_DEBUG, "\nFrames\n\n");
     for (i = 0; i < ape_ctx->totalframes; i++)
-        av_log(s, AV_LOG_DEBUG, "%8d   %8"PRId64" %8d (%d samples)\n", i,
+        av_log(s, AV_LOG_DEBUG, "%8d   %8"PRId64" %8"PRId64" (%d samples)\n", i,
                ape_ctx->frames[i].pos, ape_ctx->frames[i].size,
                ape_ctx->frames[i].nblocks);
 
@@ -166,7 +166,8 @@ static int ape_read_header(AVFormatContext * s)
     AVStream *st;
     uint32_t tag;
     int i, ret;
-    int total_blocks, final_size = 0;
+    int total_blocks;
+    int64_t final_size = 0;
     int64_t pts, file_size;
 
     /* Skip any leading junk such as id3v2 tags */
@@ -253,7 +254,7 @@ static int ape_read_header(AVFormatContext * s)
             avio_skip(pb, ape->wavheaderlength);
     }
 
-    if(!ape->totalframes){
+    if(!ape->totalframes || pb->eof_reached){
         av_log(s, AV_LOG_ERROR, "No frames in the file!\n");
         return AVERROR(EINVAL);
     }
@@ -298,8 +299,11 @@ static int ape_read_header(AVFormatContext * s)
             for (i = 0; i < ape->totalframes && !pb->eof_reached; i++)
                 ape->bittable[i] = avio_r8(pb);
         }
-        if (pb->eof_reached)
-            av_log(s, AV_LOG_WARNING, "File truncated\n");
+        if (pb->eof_reached) {
+            av_log(s, AV_LOG_ERROR, "File truncated\n");
+            ret = AVERROR_INVALIDDATA;
+            goto fail;
+        }
     }
 
     ape->frames[0].pos     = ape->firstframe;
@@ -320,7 +324,7 @@ static int ape_read_header(AVFormatContext * s)
         final_size -= final_size & 3;
     }
     if (file_size <= 0 || final_size <= 0)
-        final_size = ape->finalframeblocks * 8;
+        final_size = ape->finalframeblocks * 8LL;
     ape->frames[ape->totalframes - 1].size = final_size;
 
     for (i = 0; i < ape->totalframes; i++) {
@@ -328,6 +332,8 @@ static int ape_read_header(AVFormatContext * s)
             ape->frames[i].pos  -= ape->frames[i].skip;
             ape->frames[i].size += ape->frames[i].skip;
         }
+        if (ape->frames[i].size > INT_MAX - 3)
+            return AVERROR_INVALIDDATA;
         ape->frames[i].size = (ape->frames[i].size + 3) & ~3;
     }
     if (ape->fileversion < 3810) {
@@ -417,7 +423,7 @@ static int ape_read_packet(AVFormatContext * s, AVPacket * pkt)
 
     if (ape->frames[ape->currentframe].size <= 0 ||
         ape->frames[ape->currentframe].size > INT_MAX - extra_size) {
-        av_log(s, AV_LOG_ERROR, "invalid packet size: %d\n",
+        av_log(s, AV_LOG_ERROR, "invalid packet size: %8"PRId64"\n",
                ape->frames[ape->currentframe].size);
         ape->currentframe++;
         return AVERROR(EIO);

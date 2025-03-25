@@ -79,6 +79,7 @@ typedef struct TiffContext {
     int fill_order;
     uint32_t res[4];
     int is_thumbnail;
+    unsigned last_tag;
 
     int is_bayer;
     uint8_t pattern[4];
@@ -98,7 +99,6 @@ typedef struct TiffContext {
     int is_tiled;
     int tile_byte_counts_offset, tile_offsets_offset;
     int tile_width, tile_length;
-    int tile_count;
 
     int is_jpeg;
 
@@ -317,7 +317,8 @@ static void av_always_inline horizontal_fill(TiffContext *s,
             uint8_t shift = is_dng ? 0 : 16 - bpp;
             GetBitContext gb;
 
-            init_get_bits8(&gb, src, width);
+            int ret = init_get_bits8(&gb, src, width);
+            av_assert1(ret >= 0);
             for (int i = 0; i < s->width; i++) {
                 dst16[i] = get_bits(&gb, bpp) << shift;
             }
@@ -351,7 +352,8 @@ static void unpack_gray(TiffContext *s, AVFrame *p,
     GetBitContext gb;
     uint16_t *dst = (uint16_t *)(p->data[0] + lnum * p->linesize[0]);
 
-    init_get_bits8(&gb, src, width);
+    int ret = init_get_bits8(&gb, src, width);
+    av_assert1(ret >= 0);
 
     for (int i = 0; i < s->width; i++) {
         dst[i] = get_bits(&gb, bpp);
@@ -591,6 +593,7 @@ static int tiff_unpack_strip(TiffContext *s, AVFrame *p, uint8_t *dst, int strid
     if (s->is_bayer) {
         av_assert0(width == (s->bpp * s->width + 7) >> 3);
     }
+    av_assert0(!(s->is_bayer && is_yuv));
     if (p->format == AV_PIX_FMT_GRAY12) {
         av_fast_padded_malloc(&s->yuv_line, &s->yuv_line_size, width);
         if (s->yuv_line == NULL) {
@@ -674,6 +677,8 @@ static int tiff_unpack_strip(TiffContext *s, AVFrame *p, uint8_t *dst, int strid
             av_log(s->avctx, AV_LOG_ERROR, "More than one DNG JPEG strips unsupported\n");
             return AVERROR_PATCHWELCOME;
         }
+        if (!s->is_bayer)
+            return AVERROR_PATCHWELCOME;
         if ((ret = dng_decode_strip(s->avctx, p)) < 0)
             return ret;
         return 0;
@@ -709,7 +714,7 @@ static int tiff_unpack_strip(TiffContext *s, AVFrame *p, uint8_t *dst, int strid
             if (is_dng) {
                 int is_u16, pixel_size_bytes, pixel_size_bits, elements;
 
-                is_u16 = (s->bpp > 8);
+                is_u16 = (s->bpp / s->bppcount > 8);
                 pixel_size_bits = (is_u16 ? 16 : 8);
                 pixel_size_bytes = (is_u16 ? sizeof(uint16_t) : sizeof(uint8_t));
 
@@ -918,6 +923,11 @@ static int dng_decode_jpeg(AVCodecContext *avctx, AVFrame *frame,
 
     /* Copy the outputted tile's pixels from 'jpgframe' to 'frame' (final buffer) */
 
+    if (s->jpgframe->width  != s->avctx_mjpeg->width  ||
+        s->jpgframe->height != s->avctx_mjpeg->height ||
+        s->jpgframe->format != s->avctx_mjpeg->pix_fmt)
+        return AVERROR_INVALIDDATA;
+
     /* See dng_blit for explanation */
     if (s->avctx_mjpeg->width  == w * 2 &&
         s->avctx_mjpeg->height == h / 2 &&
@@ -985,7 +995,7 @@ static int dng_decode_tiles(AVCodecContext *avctx, AVFrame *frame, AVPacket *avp
     tile_count_y = (s->height + s->tile_length - 1) / s->tile_length;
 
     /* Iterate over the number of tiles */
-    for (tile_idx = 0; tile_idx < s->tile_count; tile_idx++) {
+    for (tile_idx = 0; tile_idx < tile_count_x * tile_count_y; tile_idx++) {
         tile_x = tile_idx % tile_count_x;
         tile_y = tile_idx / tile_count_x;
 
@@ -1252,6 +1262,12 @@ static int tiff_decode_tag(TiffContext *s, AVFrame *frame)
     if (ret < 0) {
         goto end;
     }
+    if (tag <= s->last_tag)
+        return AVERROR_INVALIDDATA;
+
+    // We ignore TIFF_STRIP_SIZE as it is sometimes in the logic but wrong order around TIFF_STRIP_OFFS
+    if (tag != TIFF_STRIP_SIZE)
+        s->last_tag = tag;
 
     off = bytestream2_tell(&s->gb);
     if (count == 1) {
@@ -1284,13 +1300,17 @@ static int tiff_decode_tag(TiffContext *s, AVFrame *frame)
         s->is_thumbnail = (value != 0);
         break;
     case TIFF_WIDTH:
+        if (value > INT_MAX)
+            return AVERROR_INVALIDDATA;
         s->width = value;
         break;
     case TIFF_HEIGHT:
+        if (value > INT_MAX)
+            return AVERROR_INVALIDDATA;
         s->height = value;
         break;
     case TIFF_BPP:
-        if (count > 5U) {
+        if (count > 5 || count <= 0) {
             av_log(s->avctx, AV_LOG_ERROR,
                    "This format is not supported (bpp=%d, %d components)\n",
                    value, count);
@@ -1321,9 +1341,9 @@ static int tiff_decode_tag(TiffContext *s, AVFrame *frame)
                    "Samples per pixel requires a single value, many provided\n");
             return AVERROR_INVALIDDATA;
         }
-        if (value > 5U) {
+        if (value > 5 || value <= 0) {
             av_log(s->avctx, AV_LOG_ERROR,
-                   "Samples per pixel %d is too large\n", value);
+                   "Invalid samples per pixel %d\n", value);
             return AVERROR_INVALIDDATA;
         }
         if (s->bppcount == 1)
@@ -1412,19 +1432,24 @@ static int tiff_decode_tag(TiffContext *s, AVFrame *frame)
         break;
     case TIFF_TILE_OFFSETS:
         s->tile_offsets_offset = off;
-        s->tile_count = count;
         s->is_tiled = 1;
         break;
     case TIFF_TILE_BYTE_COUNTS:
         s->tile_byte_counts_offset = off;
         break;
     case TIFF_TILE_LENGTH:
+        if (value > INT_MAX)
+            return AVERROR_INVALIDDATA;
         s->tile_length = value;
         break;
     case TIFF_TILE_WIDTH:
+        if (value > INT_MAX)
+            return AVERROR_INVALIDDATA;
         s->tile_width = value;
         break;
     case TIFF_PREDICTOR:
+        if (value > INT_MAX)
+            return AVERROR_INVALIDDATA;
         s->predictor = value;
         break;
     case TIFF_SUB_IFDS:
@@ -1434,7 +1459,9 @@ static int tiff_decode_tag(TiffContext *s, AVFrame *frame)
             s->sub_ifd = ff_tget(&s->gb, TIFF_LONG, s->le); /** Only get the first SubIFD */
         break;
     case DNG_LINEARIZATION_TABLE:
-        for (int i = 0; i < FFMIN(count, 1 << s->bpp); i++)
+        if (count < 1 || count > FF_ARRAY_ELEMS(s->dng_lut))
+            return AVERROR_INVALIDDATA;
+        for (int i = 0; i < count; i++)
             s->dng_lut[i] = ff_tget(&s->gb, type, s->le);
         break;
     case DNG_BLACK_LEVEL:
@@ -1553,12 +1580,18 @@ static int tiff_decode_tag(TiffContext *s, AVFrame *frame)
         }
         break;
     case TIFF_T4OPTIONS:
-        if (s->compr == TIFF_G3)
+        if (s->compr == TIFF_G3) {
+            if (value > INT_MAX)
+                return AVERROR_INVALIDDATA;
             s->fax_opts = value;
+        }
         break;
     case TIFF_T6OPTIONS:
-        if (s->compr == TIFF_G4)
+        if (s->compr == TIFF_G4) {
+            if (value > INT_MAX)
+                return AVERROR_INVALIDDATA;
             s->fax_opts = value;
+        }
         break;
 #define ADD_METADATA(count, name, sep)\
     if ((ret = add_metadata(count, type, name, sep, s, frame)) < 0) {\
@@ -1769,7 +1802,7 @@ static int decode_frame(AVCodecContext *avctx,
     TiffContext *const s = avctx->priv_data;
     AVFrame *const p = data;
     ThreadFrame frame = { .f = data };
-    unsigned off, last_off;
+    unsigned off, last_off = 0;
     int le, ret, plane, planes;
     int i, j, entries, stride;
     unsigned soff, ssize;
@@ -1805,6 +1838,7 @@ again:
     s->is_tiled    = 0;
     s->is_jpeg     = 0;
     s->cur_page    = 0;
+    s->last_tag    = 0;
 
     for (i = 0; i < 65536; i++)
         s->dng_lut[i] = i;
@@ -1833,7 +1867,6 @@ again:
     /** whether we should process this multi-page IFD's next page */
     retry_for_page = s->get_page && s->cur_page + 1 < s->get_page;  // get_page is 1-indexed
 
-    last_off = off;
     if (retry_for_page) {
         // set offset to the next IFD
         off = ff_tget_long(&s->gb, le);
@@ -1851,6 +1884,7 @@ again:
             avpriv_request_sample(s->avctx, "non increasing IFD offset\n");
             return AVERROR_INVALIDDATA;
         }
+        last_off = off;
         if (off >= UINT_MAX - 14 || avpkt->size < off + 14) {
             av_log(avctx, AV_LOG_ERROR, "IFD offset is greater than image size\n");
             return AVERROR_INVALIDDATA;
@@ -1883,8 +1917,14 @@ again:
     if (is_dng) {
         int bps;
 
+        if (s->bpp % s->bppcount)
+            return AVERROR_INVALIDDATA;
+        bps = s->bpp / s->bppcount;
+        if (bps < 8 || bps > 32)
+            return AVERROR_INVALIDDATA;
+
         if (s->white_level == 0)
-            s->white_level = (1 << s->bpp) - 1; /* Default value as per the spec */
+            s->white_level = (1LL << bps) - 1; /* Default value as per the spec */
 
         if (s->white_level <= s->black_level) {
             av_log(avctx, AV_LOG_ERROR, "BlackLevel (%"PRId32") must be less than WhiteLevel (%"PRId32")\n",
@@ -1892,11 +1932,6 @@ again:
             return AVERROR_INVALIDDATA;
         }
 
-        if (s->bpp % s->bppcount)
-            return AVERROR_INVALIDDATA;
-        bps = s->bpp / s->bppcount;
-        if (bps < 8 || bps > 32)
-            return AVERROR_INVALIDDATA;
         if (s->planar)
             return AVERROR_PATCHWELCOME;
     }
@@ -1906,7 +1941,7 @@ again:
         return AVERROR_INVALIDDATA;
     }
 
-    has_tile_bits  = s->is_tiled || s->tile_byte_counts_offset || s->tile_offsets_offset || s->tile_width || s->tile_length || s->tile_count;
+    has_tile_bits  = s->is_tiled || s->tile_byte_counts_offset || s->tile_offsets_offset || s->tile_width || s->tile_length;
     has_strip_bits = s->strippos || s->strips || s->stripoff || s->rps || s->sot || s->sstype || s->stripsize || s->stripsizesoff;
 
     if (has_tile_bits && has_strip_bits) {

@@ -2809,7 +2809,7 @@ AVOutputFormat ff_matroska_muxer = {
     .name              = "matroska",
     .long_name         = NULL_IF_CONFIG_SMALL("Matroska"),
     .mime_type         = "video/x-matroska",
-    .extensions        = "mkv",
+    .extensions        = "mks",
     .priv_data_size    = sizeof(MatroskaMuxContext),
     .audio_codec       = CONFIG_LIBVORBIS_ENCODER ?
                          AV_CODEC_ID_VORBIS : AV_CODEC_ID_AC3,
@@ -2847,18 +2847,22 @@ AVOutputFormat ff_webm_muxer = {
     .mime_type         = "video/webm",
     .extensions        = "webm",
     .priv_data_size    = sizeof(MatroskaMuxContext),
-    .audio_codec       = CONFIG_LIBOPUS_ENCODER ? AV_CODEC_ID_OPUS : AV_CODEC_ID_VORBIS,
-    .video_codec       = CONFIG_LIBVPX_VP9_ENCODER? AV_CODEC_ID_VP9 : AV_CODEC_ID_VP8,
-    .subtitle_codec    = AV_CODEC_ID_WEBVTT,
+    .audio_codec       = CONFIG_LIBOPUS_ENCODER ? AV_CODEC_ID_PCM_MULAW : AV_CODEC_ID_VORBIS,
+    .video_codec       = CONFIG_LIBVPX_VP9_ENCODER? AV_CODEC_ID_H264 : AV_CODEC_ID_VP8,
     .init              = mkv_init,
     .deinit            = mkv_deinit,
     .write_header      = mkv_write_header,
     .write_packet      = mkv_write_flush_packet,
     .write_trailer     = mkv_write_trailer,
-    .query_codec       = webm_query_codec,
-    .check_bitstream   = mkv_check_bitstream,
     .flags             = AVFMT_GLOBALHEADER | AVFMT_VARIABLE_FPS |
                          AVFMT_TS_NONSTRICT | AVFMT_ALLOW_FLUSH,
+    .codec_tag         = (const AVCodecTag* const []){
+         ff_codec_bmp_tags, ff_codec_wav_tags,
+         additional_audio_tags, additional_video_tags, additional_subtitle_tags, 0
+    },
+    .subtitle_codec    = AV_CODEC_ID_NONE,
+    .query_codec       = webm_query_codec,
+    .check_bitstream   = mkv_check_bitstream
     .priv_class        = &webm_class,
 };
 #endif
@@ -2874,7 +2878,7 @@ AVOutputFormat ff_matroska_audio_muxer = {
     .name              = "matroska",
     .long_name         = NULL_IF_CONFIG_SMALL("Matroska Audio"),
     .mime_type         = "audio/x-matroska",
-    .extensions        = "mka",
+    .extensions        = "mks",
     .priv_data_size    = sizeof(MatroskaMuxContext),
     .audio_codec       = CONFIG_LIBVORBIS_ENCODER ?
                          AV_CODEC_ID_VORBIS : AV_CODEC_ID_AC3,

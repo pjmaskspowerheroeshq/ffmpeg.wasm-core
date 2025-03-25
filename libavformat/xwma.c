@@ -151,7 +151,7 @@ static int xwma_read_header(AVFormatContext *s)
                st->codecpar->channels);
         return AVERROR_INVALIDDATA;
     }
-    if (!st->codecpar->bits_per_coded_sample) {
+    if (!st->codecpar->bits_per_coded_sample || st->codecpar->bits_per_coded_sample > 64) {
         av_log(s, AV_LOG_WARNING, "Invalid bits_per_coded_sample: %d\n",
                st->codecpar->bits_per_coded_sample);
         return AVERROR_INVALIDDATA;
@@ -211,6 +211,10 @@ static int xwma_read_header(AVFormatContext *s)
             }
 
             for (i = 0; i < dpds_table_size; ++i) {
+                if (avio_feof(pb)) {
+                    ret = AVERROR_INVALIDDATA;
+                    goto fail;
+                }
                 dpds_table[i] = avio_rl32(pb);
                 size -= 4;
             }
@@ -274,7 +278,7 @@ static int xwma_read_header(AVFormatContext *s)
          * the total duration using the average bits per sample and the
          * total data length.
          */
-        st->duration = (size<<3) * st->codecpar->sample_rate / st->codecpar->bit_rate;
+        st->duration = av_rescale((size<<3), st->codecpar->sample_rate, st->codecpar->bit_rate);
     }
 
 fail:

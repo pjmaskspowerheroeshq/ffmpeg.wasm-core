@@ -145,9 +145,16 @@ static int config_input(AVFilterLink *inlink)
     ff_draw_init(&ass->draw, inlink->format, ass->alpha ? FF_DRAW_PROCESS_ALPHA : 0);
 
     ass_set_frame_size  (ass->renderer, inlink->w, inlink->h);
-    if (ass->original_w && ass->original_h)
+    if (ass->original_w && ass->original_h) {
         ass_set_aspect_ratio(ass->renderer, (double)inlink->w / inlink->h,
                              (double)ass->original_w / ass->original_h);
+#if LIBASS_VERSION > 0x01010000
+        ass_set_storage_size(ass->renderer, ass->original_w, ass->original_h);
+    } else {
+        ass_set_storage_size(ass->renderer, inlink->w, inlink->h);
+#endif
+    }
+
     if (ass->shaping != -1)
         ass_set_shaper(ass->renderer, ass->shaping);
 
@@ -384,13 +391,15 @@ static av_cold int init_subtitles(AVFilterContext *ctx)
     if (!dec) {
         av_log(ctx, AV_LOG_ERROR, "Failed to find subtitle codec %s\n",
                avcodec_get_name(st->codecpar->codec_id));
-        return AVERROR(EINVAL);
+        ret = AVERROR_DECODER_NOT_FOUND;
+        goto end;
     }
     dec_desc = avcodec_descriptor_get(st->codecpar->codec_id);
     if (dec_desc && !(dec_desc->props & AV_CODEC_PROP_TEXT_SUB)) {
         av_log(ctx, AV_LOG_ERROR,
                "Only text based subtitles are currently supported\n");
-        return AVERROR_PATCHWELCOME;
+        ret = AVERROR_PATCHWELCOME;
+        goto end;
     }
     if (ass->charenc)
         av_dict_set(&codec_opts, "sub_charenc", ass->charenc, 0);
@@ -398,8 +407,10 @@ static av_cold int init_subtitles(AVFilterContext *ctx)
         av_dict_set(&codec_opts, "sub_text_format", "ass", 0);
 
     dec_ctx = avcodec_alloc_context3(dec);
-    if (!dec_ctx)
-        return AVERROR(ENOMEM);
+    if (!dec_ctx) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
 
     ret = avcodec_parameters_to_context(dec_ctx, st->codecpar);
     if (ret < 0)

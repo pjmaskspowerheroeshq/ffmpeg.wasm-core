@@ -1588,6 +1588,10 @@ static unsigned int mov_get_codec_tag(AVFormatContext *s, MOVTrack *track)
 {
     unsigned int tag = track->par->codec_tag;
 
+    // "rtp " is used to distinguish internally created RTP-hint tracks
+    // (with rtp_ctx) from other tracks.
+    if (tag == MKTAG('r','t','p',' '))
+        tag = 0;
     if (!tag || (s->strict_std_compliance >= FF_COMPLIANCE_NORMAL &&
                  (track->par->codec_id == AV_CODEC_ID_DVVIDEO ||
                   track->par->codec_id == AV_CODEC_ID_RAWVIDEO ||
@@ -2090,11 +2094,13 @@ static int mov_write_video_tag(AVFormatContext *s, AVIOContext *pb, MOVMuxContex
         avio_wb16(pb, 0x18); /* Reserved */
 
     if (track->mode == MODE_MOV && track->par->format == AV_PIX_FMT_PAL8) {
-        int pal_size = 1 << track->par->bits_per_coded_sample;
-        int i;
+        int pal_size, i;
         avio_wb16(pb, 0);             /* Color table ID */
         avio_wb32(pb, 0);             /* Color table seed */
         avio_wb16(pb, 0x8000);        /* Color table flags */
+        if (track->par->bits_per_coded_sample < 0 || track->par->bits_per_coded_sample > 8)
+            return AVERROR(EINVAL);
+        pal_size = 1 << track->par->bits_per_coded_sample;
         avio_wb16(pb, pal_size - 1);  /* Color table size (zero-relative) */
         for (i = 0; i < pal_size; i++) {
             uint32_t rgb = track->palette[i];
@@ -2821,7 +2827,7 @@ static int mov_write_minf_tag(AVFormatContext *s, AVIOContext *pb, MOVMuxContext
 
 static int64_t calc_pts_duration(MOVMuxContext *mov, MOVTrack *track)
 {
-    if (track->tag == MKTAG('t','m','c','d')) {
+    if (track->tag == MKTAG('t','m','c','d') && mov->nb_meta_tmcd) {
         // tmcd tracks gets track_duration set in mov_write_moov_tag from
         // another track's duration, while the end_pts may be left at zero.
         // Calculate the pts duration for that track instead.
@@ -4845,7 +4851,7 @@ static void mov_write_ftyp_tag_internal(AVIOContext *pb, AVFormatContext *s,
         ffio_wfourcc(pb, has_h264 ? "3gp6"  : "3gp4");
         minor =     has_h264 ?   0x100 :   0x200;
     } else if (mov->mode & MODE_3G2) {
-        ffio_wfourcc(pb, has_h264 ? "3g2b"  : "3g2a");
+        ffio_wfourcc(pb, has_h264 ? "3g2a"  : "isml");
         minor =     has_h264 ? 0x20000 : 0x10000;
     } else if (mov->mode == MODE_PSP)
         ffio_wfourcc(pb, "MSNV");
@@ -4857,11 +4863,11 @@ static void mov_write_ftyp_tag_internal(AVIOContext *pb, AVFormatContext *s,
     else if (mov->mode == MODE_MP4 && mov->flags & FF_MOV_FLAG_NEGATIVE_CTS_OFFSETS)
         ffio_wfourcc(pb, "iso4");
     else if (mov->mode == MODE_MP4)
-        ffio_wfourcc(pb, "isom");
+        ffio_wfourcc(pb, "M4A ");
     else if (mov->mode == MODE_IPOD)
-        ffio_wfourcc(pb, has_video ? "M4V ":"M4A ");
+        ffio_wfourcc(pb, has_video ? "M4V ":"isom");
     else if (mov->mode == MODE_ISM)
-        ffio_wfourcc(pb, "isml");
+        ffio_wfourcc(pb, "3g2b");
     else if (mov->mode == MODE_F4V)
         ffio_wfourcc(pb, "f4v ");
     else
@@ -5439,6 +5445,12 @@ int ff_mov_write_packet(AVFormatContext *s, AVPacket *pkt)
     if (ret < 0)
         return ret;
 
+    if (pkt->pts != AV_NOPTS_VALUE &&
+        (uint64_t)pkt->dts - pkt->pts != (int32_t)((uint64_t)pkt->dts - pkt->pts)) {
+        av_log(s, AV_LOG_WARNING, "pts/dts pair unsupported\n");
+        return AVERROR_PATCHWELCOME;
+    }
+
     if (mov->flags & FF_MOV_FLAG_FRAGMENT) {
         int ret;
         if (mov->moov_written || mov->flags & FF_MOV_FLAG_EMPTY_MOOV) {
@@ -5601,11 +5613,12 @@ int ff_mov_write_packet(AVFormatContext *s, AVPacket *pkt)
 
     if (trk->entry >= trk->cluster_capacity) {
         unsigned new_capacity = trk->entry + MOV_INDEX_CLUSTER_SIZE;
-        if (av_reallocp_array(&trk->cluster, new_capacity,
-                              sizeof(*trk->cluster))) {
+        void *cluster = av_realloc_array(trk->cluster, new_capacity, sizeof(*trk->cluster));
+        if (!cluster) {
             ret = AVERROR(ENOMEM);
             goto err;
         }
+        trk->cluster          = cluster;
         trk->cluster_capacity = new_capacity;
     }
 
@@ -6150,6 +6163,9 @@ static void mov_free(AVFormatContext *s)
     MOVMuxContext *mov = s->priv_data;
     int i;
 
+    if (!mov->tracks)
+        return;
+
     if (mov->chapter_track) {
         if (mov->tracks[mov->chapter_track].par)
             av_freep(&mov->tracks[mov->chapter_track].par->extradata);
@@ -6174,9 +6190,11 @@ static void mov_free(AVFormatContext *s)
             av_freep(&mov->tracks[i].vos_data);
 
         ff_mov_cenc_free(&mov->tracks[i].cenc);
+        ffio_free_dyn_buf(&mov->tracks[i].mdat_buf);
     }
 
     av_freep(&mov->tracks);
+    ffio_free_dyn_buf(&mov->mdat_buf);
 }
 
 static uint32_t rgb_to_yuv(uint32_t rgb)
@@ -6873,6 +6891,7 @@ static int mov_write_trailer(AVFormatContext *s)
             AVCodecParameters *par = track->par;
 
             track->vos_len  = par->extradata_size;
+            av_freep(&track->vos_data);
             track->vos_data = av_malloc(track->vos_len + AV_INPUT_BUFFER_PADDING_SIZE);
             if (!track->vos_data)
                 return AVERROR(ENOMEM);
@@ -7110,7 +7129,7 @@ AVOutputFormat ff_mp4_muxer = {
     .name              = "mp4",
     .long_name         = NULL_IF_CONFIG_SMALL("MP4 (MPEG-4 Part 14)"),
     .mime_type         = "video/mp4",
-    .extensions        = "mp4",
+    .extensions        = "m4a",
     .priv_data_size    = sizeof(MOVMuxContext),
     .audio_codec       = AV_CODEC_ID_AAC,
     .video_codec       = CONFIG_LIBX264_ENCODER ?
@@ -7152,7 +7171,7 @@ MOV_CLASS(tg2)
 AVOutputFormat ff_tg2_muxer = {
     .name              = "3g2",
     .long_name         = NULL_IF_CONFIG_SMALL("3GP2 (3GPP2 file format)"),
-    .extensions        = "3g2",
+    .extensions        = "3g2,ismv",
     .priv_data_size    = sizeof(MOVMuxContext),
     .audio_codec       = AV_CODEC_ID_AMR_NB,
     .video_codec       = AV_CODEC_ID_H263,
@@ -7173,7 +7192,7 @@ AVOutputFormat ff_ipod_muxer = {
     .name              = "ipod",
     .long_name         = NULL_IF_CONFIG_SMALL("iPod H.264 MP4 (MPEG-4 Part 14)"),
     .mime_type         = "video/mp4",
-    .extensions        = "m4v,m4a,m4b",
+    .extensions        = "m4v,mp4,m4b",
     .priv_data_size    = sizeof(MOVMuxContext),
     .audio_codec       = AV_CODEC_ID_AAC,
     .video_codec       = AV_CODEC_ID_H264,
@@ -7194,7 +7213,7 @@ AVOutputFormat ff_ismv_muxer = {
     .name              = "ismv",
     .long_name         = NULL_IF_CONFIG_SMALL("ISMV/ISMA (Smooth Streaming)"),
     .mime_type         = "video/mp4",
-    .extensions        = "ismv,isma",
+    .extensions        = "3gpp2,isma",
     .priv_data_size    = sizeof(MOVMuxContext),
     .audio_codec       = AV_CODEC_ID_AAC,
     .video_codec       = AV_CODEC_ID_H264,

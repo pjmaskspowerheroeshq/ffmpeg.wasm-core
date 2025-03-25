@@ -104,7 +104,7 @@ typedef struct ASFContext {
     int ts_is_pts;
     int packet_multi_size;
     int packet_time_delta;
-    int packet_time_start;
+    int64_t packet_time_start;
     int64_t packet_pos;
 
     int stream_index;
@@ -424,7 +424,7 @@ static int asf_read_stream_properties(AVFormatContext *s, int64_t size)
     if (!(asf->hdr.flags & 0x01)) { // if we aren't streaming...
         int64_t fsize = avio_size(pb);
         if (fsize <= 0 || (int64_t)asf->hdr.file_size <= 0 ||
-            20*FFABS(fsize - (int64_t)asf->hdr.file_size) < FFMIN(fsize, asf->hdr.file_size))
+            FFABS(fsize - (int64_t)asf->hdr.file_size) < FFMIN(fsize, asf->hdr.file_size)/20)
             st->duration = asf->hdr.play_time /
                        (10000000 / 1000) - start_time;
     }
@@ -516,6 +516,8 @@ static int asf_read_stream_properties(AVFormatContext *s, int64_t size)
         tag1                             = avio_rl32(pb);
         avio_skip(pb, 20);
         if (sizeX > 40) {
+            if (size < sizeX - 40 || sizeX - 40 > INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE)
+                return AVERROR_INVALIDDATA;
             st->codecpar->extradata_size = ffio_limit(pb, sizeX - 40);
             st->codecpar->extradata      = av_mallocz(st->codecpar->extradata_size +
                                                    AV_INPUT_BUFFER_PADDING_SIZE);
@@ -607,6 +609,8 @@ static int asf_read_ext_stream_properties(AVFormatContext *s, int64_t size)
         ff_get_guid(pb, &g);
         size = avio_rl16(pb);
         ext_len = avio_rl32(pb);
+        if (ext_len < 0)
+            return AVERROR_INVALIDDATA;
         avio_skip(pb, ext_len);
         if (stream_num < 128 && i < FF_ARRAY_ELEMS(asf->streams[stream_num].payload)) {
             ASFPayload *p = &asf->streams[stream_num].payload[i];
@@ -764,11 +768,13 @@ static int asf_read_marker(AVFormatContext *s, int64_t size)
 
         avio_rl64(pb);             // offset, 8 bytes
         pres_time = avio_rl64(pb); // presentation time
-        pres_time -= asf->hdr.preroll * 10000;
+        pres_time = av_sat_sub64(pres_time, asf->hdr.preroll * 10000LL);
         avio_rl16(pb);             // entry length
         avio_rl32(pb);             // send time
         avio_rl32(pb);             // flags
         name_len = avio_rl32(pb);  // name length
+        if ((unsigned)name_len > INT_MAX / 2)
+            return AVERROR_INVALIDDATA;
         if ((ret = avio_get_str16le(pb, name_len * 2, name,
                                     sizeof(name))) < name_len)
             avio_skip(pb, name_len - ret);
@@ -1309,10 +1315,12 @@ static int asf_parse_packet(AVFormatContext *s, AVIOContext *pb, AVPacket *pkt)
             if ((ret = av_new_packet(&asf_st->pkt, asf_st->packet_obj_size)) < 0)
                 return ret;
             asf_st->seq              = asf->packet_seq;
-            if (asf->ts_is_pts) {
-                asf_st->pkt.pts          = asf->packet_frag_timestamp - asf->hdr.preroll;
-            } else
-                asf_st->pkt.dts          = asf->packet_frag_timestamp - asf->hdr.preroll;
+            if (asf->packet_frag_timestamp != AV_NOPTS_VALUE) {
+                if (asf->ts_is_pts) {
+                    asf_st->pkt.pts          = asf->packet_frag_timestamp - asf->hdr.preroll;
+                } else
+                    asf_st->pkt.dts          = asf->packet_frag_timestamp - asf->hdr.preroll;
+            }
             asf_st->pkt.stream_index = asf->stream_index;
             asf_st->pkt.pos          = asf_st->packet_pos = asf->packet_pos;
             asf_st->pkt_clean        = 0;

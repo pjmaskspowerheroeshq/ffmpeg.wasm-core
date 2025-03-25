@@ -59,7 +59,7 @@ static int alloc_lines(SwsSlice *s, int size, int width)
         for (j = 0; j < n; ++j) {
             // chroma plane line U and V are expected to be contiguous in memory
             // by mmx vertical scaler code
-            s->plane[i].line[j] = av_malloc(size * 2 + 32);
+            s->plane[i].line[j] = av_mallocz(size * 2 + 32);
             if (!s->plane[i].line[j]) {
                 free_lines(s);
                 return AVERROR(ENOMEM);
@@ -292,7 +292,10 @@ int ff_init_filters(SwsContext * c)
     if (!c->desc)
         return AVERROR(ENOMEM);
     c->slice = av_mallocz_array(sizeof(SwsSlice), c->numSlice);
-
+    if (!c->slice) {
+        res = AVERROR(ENOMEM);
+        goto cleanup;
+    }
 
     res = alloc_slice(&c->slice[0], c->srcFormat, c->srcH, c->chrSrcH, c->chrSrcHSubSample, c->chrSrcVSubSample, 0);
     if (res < 0) goto cleanup;

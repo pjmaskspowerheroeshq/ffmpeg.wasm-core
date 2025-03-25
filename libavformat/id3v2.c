@@ -365,7 +365,7 @@ static void read_uslt(AVFormatContext *s, AVIOContext *pb, int taglen,
     int encoding;
     int ok = 0;
 
-    if (taglen < 1)
+    if (taglen < 4)
         goto error;
 
     encoding = avio_r8(pb);
@@ -376,10 +376,10 @@ static void read_uslt(AVFormatContext *s, AVIOContext *pb, int taglen,
     lang[3] = '\0';
     taglen -= 3;
 
-    if (decode_str(s, pb, encoding, &descriptor, &taglen) < 0)
+    if (decode_str(s, pb, encoding, &descriptor, &taglen) < 0 || taglen < 0)
         goto error;
 
-    if (decode_str(s, pb, encoding, &text, &taglen) < 0)
+    if (decode_str(s, pb, encoding, &text, &taglen) < 0 || taglen < 0)
         goto error;
 
     // FFmpeg does not support hierarchical metadata, so concatenate the keys.
@@ -605,7 +605,10 @@ static void read_apic(AVFormatContext *s, AVIOContext *pb, int taglen,
 
     /* mimetype */
     if (isv34) {
-        taglen -= avio_get_str(pb, taglen, mimetype, sizeof(mimetype));
+        int ret = avio_get_str(pb, taglen, mimetype, sizeof(mimetype));
+        if (ret < 0 || ret >= taglen)
+            goto fail;
+        taglen -= ret;
     } else {
         if (avio_read(pb, mimetype, 3) < 0)
             goto fail;
@@ -813,7 +816,7 @@ static void id3v2_parse(AVIOContext *pb, AVDictionary **metadata,
     int isv34, unsync;
     unsigned tlen;
     char tag[5];
-    int64_t next, end = avio_tell(pb) + len;
+    int64_t next, end = avio_tell(pb);
     int taghdrlen;
     const char *reason = NULL;
     AVIOContext pb_local;
@@ -824,6 +827,10 @@ static void id3v2_parse(AVIOContext *pb, AVDictionary **metadata,
     unsigned char *uncompressed_buffer = NULL;
     av_unused int uncompressed_buffer_size = 0;
     const char *comm_frame;
+
+    if (end > INT64_MAX - len - 10)
+        return;
+    end += len;
 
     av_log(s, AV_LOG_DEBUG, "id3v2 ver:%d flags:%02X len:%d\n", version, flags, len);
 
@@ -992,6 +999,9 @@ static void id3v2_parse(AVIOContext *pb, AVDictionary **metadata,
                     int err;
 
                     av_log(s, AV_LOG_DEBUG, "Compresssed frame %s tlen=%d dlen=%ld\n", tag, tlen, dlen);
+
+                    if (tlen <= 0)
+                        goto seek;
 
                     av_fast_malloc(&uncompressed_buffer, &uncompressed_buffer_size, dlen);
                     if (!uncompressed_buffer) {

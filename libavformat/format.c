@@ -48,6 +48,31 @@ int av_match_ext(const char *filename, const char *extensions)
     return 0;
 }
 
+int ff_match_url_ext(const char *url, const char *extensions)
+{
+    const char *ext;
+    URLComponents uc;
+    int ret;
+    char scratchpad[128];
+
+    if (!url)
+        return 0;
+
+    ret = ff_url_decompose(&uc, url, NULL);
+    if (ret < 0 || !URL_COMPONENT_HAVE(uc, scheme))
+        return ret;
+    for (ext = uc.query; *ext != '.' && ext > uc.path; ext--)
+        ;
+
+    if (*ext != '.')
+        return 0;
+    if (uc.query - ext > sizeof(scratchpad))
+        return AVERROR(ENOMEM); //not enough memory in our scratchpad
+    av_strlcpy(scratchpad, ext + 1, FFMIN(sizeof(scratchpad), uc.query - ext));
+
+    return av_match_name(scratchpad, extensions);
+}
+
 ff_const59 AVOutputFormat *av_guess_format(const char *short_name, const char *filename,
                                 const char *mime_type)
 {
@@ -228,6 +253,7 @@ int av_probe_input_buffer2(AVIOContext *pb, ff_const59 AVInputFormat **fmt,
     int ret = 0, probe_size, buf_offset = 0;
     int score = 0;
     int ret2;
+    int eof = 0;
 
     if (!max_probe_size)
         max_probe_size = PROBE_BUF_MAX;
@@ -251,7 +277,7 @@ int av_probe_input_buffer2(AVIOContext *pb, ff_const59 AVInputFormat **fmt,
         }
     }
 
-    for (probe_size = PROBE_BUF_MIN; probe_size <= max_probe_size && !*fmt;
+    for (probe_size = PROBE_BUF_MIN; probe_size <= max_probe_size && !*fmt && !eof;
          probe_size = FFMIN(probe_size << 1,
                             FFMAX(max_probe_size, probe_size + 1))) {
         score = probe_size < max_probe_size ? AVPROBE_SCORE_RETRY : 0;
@@ -267,6 +293,7 @@ int av_probe_input_buffer2(AVIOContext *pb, ff_const59 AVInputFormat **fmt,
 
             score = 0;
             ret   = 0;          /* error was end of file, nothing read */
+            eof   = 1;
         }
         buf_offset += ret;
         if (buf_offset < offset)

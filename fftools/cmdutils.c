@@ -135,12 +135,6 @@ void exit_program(int ret)
     if (program_exit)
         program_exit(ret);
 
-    /*
-     * Print an unique message here to detect
-     * end of operation in JavaScript.
-     */
-    printf("FFMPEG_END\n");
-
     exit(ret);
 }
 
@@ -544,7 +538,7 @@ static const AVOption *opt_find(void *obj, const char *name, const char *unit,
     return o;
 }
 
-#define FLAGS (o->type == AV_OPT_TYPE_FLAGS && (arg[0]=='-' || arg[0]=='+')) ? AV_DICT_APPEND : 0
+#define FLAGS ((o->type == AV_OPT_TYPE_FLAGS && (arg[0]=='-' || arg[0]=='+')) ? AV_DICT_APPEND : 0)
 int opt_default(void *optctx, const char *opt, const char *arg)
 {
     const AVOption *o;

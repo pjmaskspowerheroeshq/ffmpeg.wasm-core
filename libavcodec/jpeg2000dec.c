@@ -317,6 +317,16 @@ static int get_siz(Jpeg2000DecoderContext *s)
         return AVERROR_INVALIDDATA;
     }
 
+    if (s->image_offset_x >= s->width || s->image_offset_y >= s->height) {
+        av_log(s->avctx, AV_LOG_ERROR, "image offsets outside image");
+        return AVERROR_INVALIDDATA;
+    }
+
+    if (s->reduction_factor && (s->image_offset_x || s->image_offset_y) ){
+        av_log(s->avctx, AV_LOG_ERROR, "reduction factor with image offsets is not fully implemented");
+        return AVERROR_PATCHWELCOME;
+    }
+
     s->ncomponents = ncomponents;
 
     if (s->tile_width <= 0 || s->tile_height <= 0) {
@@ -872,9 +882,6 @@ static int get_tlm(Jpeg2000DecoderContext *s, int n)
             break;
         case 2:
             bytestream2_get_be16(&s->g);
-            break;
-        case 3:
-            bytestream2_get_be32(&s->g);
             break;
         }
         if (SP == 0) {
@@ -2207,8 +2214,12 @@ static int jp2_find_codestream(Jpeg2000DecoderContext *s)
                 return 0;
             }
             atom_size = bytestream2_get_be32u(&s->g);
+            if (atom_size < 16 || (int64_t)bytestream2_tell(&s->g) + atom_size - 16 > INT_MAX)
+                return AVERROR_INVALIDDATA;
             atom_end  = bytestream2_tell(&s->g) + atom_size - 16;
         } else {
+            if (atom_size <  8 || (int64_t)bytestream2_tell(&s->g) + atom_size -  8 > INT_MAX)
+                return AVERROR_INVALIDDATA;
             atom_end  = bytestream2_tell(&s->g) + atom_size -  8;
         }
 
@@ -2222,6 +2233,8 @@ static int jp2_find_codestream(Jpeg2000DecoderContext *s)
                    atom_size >= 16) {
             uint32_t atom2_size, atom2, atom2_end;
             do {
+                if (bytestream2_get_bytes_left(&s->g) < 8)
+                    break;
                 atom2_size = bytestream2_get_be32u(&s->g);
                 atom2      = bytestream2_get_be32u(&s->g);
                 atom2_end  = bytestream2_tell(&s->g) + atom2_size - 8;

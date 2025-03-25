@@ -101,9 +101,9 @@ static AVRational read_fps(const char* line, int* error)
         line++;
     for (; *line>='0' && *line<='9'; line++) {
         // Truncate any numerator too large to fit into an int64_t
-        if (num > (INT64_MAX - 9) / 10 || den > INT64_MAX / 10)
+        if (num > (INT64_MAX - 9) / 10ULL || den > INT64_MAX / 10ULL)
             break;
-        num  = 10 * num + *line - '0';
+        num  = 10 * num + (*line - '0');
         den *= 10;
     }
     if (!num)
@@ -117,7 +117,7 @@ static int rpl_read_header(AVFormatContext *s)
     AVIOContext *pb = s->pb;
     RPLContext *rpl = s->priv_data;
     AVStream *vst = NULL, *ast = NULL;
-    int total_audio_size;
+    int64_t total_audio_size;
     int error = 0;
     const char *endptr;
     char audio_type[RPL_LINE_LENGTH];
@@ -207,8 +207,10 @@ static int rpl_read_header(AVFormatContext *s)
             ast->codecpar->bits_per_coded_sample = 4;
 
         ast->codecpar->bit_rate = ast->codecpar->sample_rate *
-                                  ast->codecpar->bits_per_coded_sample *
-                                  ast->codecpar->channels;
+                                  (int64_t)ast->codecpar->channels;
+        if (ast->codecpar->bit_rate > INT64_MAX / ast->codecpar->bits_per_coded_sample)
+            return AVERROR_INVALIDDATA;
+        ast->codecpar->bit_rate *= ast->codecpar->bits_per_coded_sample;
 
         ast->codecpar->codec_id = AV_CODEC_ID_NONE;
         switch (audio_format) {
@@ -253,6 +255,9 @@ static int rpl_read_header(AVFormatContext *s)
             error |= read_line(pb, line, sizeof(line));
     }
 
+    if (s->nb_streams == 0)
+        return AVERROR_INVALIDDATA;
+
     rpl->frames_per_chunk = read_line_and_int(pb, &error);  // video frames per chunk
     if (vst && rpl->frames_per_chunk > 1 && vst->codecpar->codec_tag != 124)
         av_log(s, AV_LOG_WARNING,
@@ -260,6 +265,9 @@ static int rpl_read_header(AVFormatContext *s)
                "Video stream will be broken!\n", av_fourcc2str(vst->codecpar->codec_tag));
 
     number_of_chunks = read_line_and_int(pb, &error);  // number of chunks in the file
+    if (number_of_chunks == INT_MAX)
+        return AVERROR_INVALIDDATA;
+
     // The number in the header is actually the index of the last chunk.
     number_of_chunks++;
 
@@ -271,7 +279,7 @@ static int rpl_read_header(AVFormatContext *s)
     error |= read_line(pb, line, sizeof(line));  // size of "helpful" sprite
     if (vst) {
         error |= read_line(pb, line, sizeof(line));  // offset to key frame list
-        vst->duration = number_of_chunks * rpl->frames_per_chunk;
+        vst->duration = number_of_chunks * (int64_t)rpl->frames_per_chunk;
     }
 
     // Read the index
@@ -291,6 +299,8 @@ static int rpl_read_header(AVFormatContext *s)
         if (ast)
             av_add_index_entry(ast, offset + video_size, total_audio_size,
                                audio_size, audio_size * 8, 0);
+        if (total_audio_size/8 + (uint64_t)audio_size >= INT64_MAX/8)
+            return AVERROR_INVALIDDATA;
         total_audio_size += audio_size * 8;
     }
 
@@ -331,7 +341,7 @@ static int rpl_read_packet(AVFormatContext *s, AVPacket *pkt)
 
         avio_skip(pb, 4); /* flags */
         frame_size = avio_rl32(pb);
-        if (avio_seek(pb, -8, SEEK_CUR) < 0)
+        if (avio_feof(pb) || avio_seek(pb, -8, SEEK_CUR) < 0 || !frame_size)
             return AVERROR(EIO);
 
         ret = av_get_packet(pb, pkt, frame_size);

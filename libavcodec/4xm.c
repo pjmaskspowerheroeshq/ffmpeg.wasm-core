@@ -498,8 +498,8 @@ static int decode_i_block(FourXContext *f, int16_t *block)
 {
     int code, i, j, level, val;
 
-    if (get_bits_left(&f->gb) < 2){
-        av_log(f->avctx, AV_LOG_ERROR, "%d bits left before decode_i_block()\n", get_bits_left(&f->gb));
+    if (get_bits_left(&f->pre_gb) < 2) {
+        av_log(f->avctx, AV_LOG_ERROR, "%d bits left before decode_i_block()\n", get_bits_left(&f->pre_gb));
         return AVERROR_INVALIDDATA;
     }
 
@@ -885,6 +885,8 @@ static int decode_frame(AVCodecContext *avctx, void *data,
         }
 
         if (i >= CFRAME_BUFFER_COUNT) {
+            if (free_index < 0)
+                return AVERROR_INVALIDDATA;
             i             = free_index;
             f->cfrm[i].id = id;
         }

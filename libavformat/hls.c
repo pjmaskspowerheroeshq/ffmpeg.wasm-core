@@ -208,6 +208,7 @@ typedef struct HLSContext {
     AVIOInterruptCB *interrupt_callback;
     AVDictionary *avio_opts;
     char *allowed_extensions;
+    int extension_picky;
     int max_reload;
     int http_persistent;
     int http_multiple;
@@ -236,6 +237,7 @@ static void free_init_section_list(struct playlist *pls)
 {
     int i;
     for (i = 0; i < pls->n_init_sections; i++) {
+        av_freep(&pls->init_sections[i]->key);
         av_freep(&pls->init_sections[i]->url);
         av_freep(&pls->init_sections[i]);
     }
@@ -311,8 +313,10 @@ static struct playlist *new_playlist(HLSContext *c, const char *url,
         return NULL;
     reset_packet(&pls->pkt);
     ff_make_absolute_url(pls->url, sizeof(pls->url), base, url);
-    if (!pls->url[0])
+    if (!pls->url[0]) {
+        av_free(pls);
         return NULL;
+    }
     pls->seek_timestamp = AV_NOPTS_VALUE;
 
     pls->is_id3_timestamped = -1;
@@ -625,7 +629,7 @@ static int open_url_keepalive(AVFormatContext *s, AVIOContext **pb,
 }
 
 static int open_url(AVFormatContext *s, AVIOContext **pb, const char *url,
-                    AVDictionary *opts, AVDictionary *opts2, int *is_http_out)
+                    AVDictionary **opts, AVDictionary *opts2, int *is_http_out)
 {
     HLSContext *c = s->priv_data;
     AVDictionary *tmp = NULL;
@@ -672,7 +676,7 @@ static int open_url(AVFormatContext *s, AVIOContext **pb, const char *url,
     else if (strcmp(proto_name, "file") || !strncmp(url, "file,", 5))
         return AVERROR_INVALIDDATA;
 
-    av_dict_copy(&tmp, opts, 0);
+    av_dict_copy(&tmp, *opts, 0);
     av_dict_copy(&tmp, opts2, 0);
 
     if (is_http && c->http_persistent && *pb) {
@@ -698,7 +702,7 @@ static int open_url(AVFormatContext *s, AVIOContext **pb, const char *url,
             av_opt_get(*pb, "cookies", AV_OPT_SEARCH_CHILDREN, (uint8_t**)&new_cookies);
 
         if (new_cookies)
-            av_dict_set(&opts, "cookies", new_cookies, AV_DICT_DONT_STRDUP_VAL);
+            av_dict_set(opts, "cookies", new_cookies, AV_DICT_DONT_STRDUP_VAL);
     }
 
     av_dict_free(&tmp);
@@ -707,6 +711,46 @@ static int open_url(AVFormatContext *s, AVIOContext **pb, const char *url,
         *is_http_out = is_http;
 
     return ret;
+}
+
+static int test_segment(AVFormatContext *s, const AVInputFormat *in_fmt, struct playlist *pls, struct segment *seg)
+{
+    HLSContext *c = s->priv_data;
+    int matchA = 3;
+    int matchF = 0;
+
+    if (!c->extension_picky)
+        return 0;
+
+    if (strcmp(c->allowed_extensions, "ALL"))
+        matchA =      av_match_ext    (seg->url, c->allowed_extensions)
+                 + 2*(ff_match_url_ext(seg->url, c->allowed_extensions) > 0);
+
+    if (!matchA) {
+        av_log(s, AV_LOG_ERROR, "URL %s is not in allowed_extensions\n", seg->url);
+        return AVERROR_INVALIDDATA;
+    }
+
+    if (in_fmt) {
+        if (in_fmt->extensions) {
+            matchF =      av_match_ext(    seg->url, in_fmt->extensions)
+                     + 2*(ff_match_url_ext(seg->url, in_fmt->extensions) > 0);
+            if(av_match_name("mp4", in_fmt->name)) {
+                matchF |=      av_match_ext(    seg->url, "ts,m2t,m2ts,mts,mpg,m4s,mpeg,mpegts")
+                          + 2*(ff_match_url_ext(seg->url, "ts,m2t,m2ts,mts,mpg,m4s,mpeg,mpegts") > 0);
+            }
+        } else if (!strcmp(in_fmt->name, "mpegts")) {
+            matchF =      av_match_ext(    seg->url, "ts,m2t,m2ts,mts,mpg,m4s,mpeg,mpegts")
+                     + 2*(ff_match_url_ext(seg->url, "ts,m2t,m2ts,mts,mpg,m4s,mpeg,mpegts") > 0);
+        }
+
+        if (!(matchA & matchF)) {
+            av_log(s, AV_LOG_ERROR, "detected format %s extension %s mismatches allowed extensions in url %s\n", in_fmt->name, in_fmt->extensions ? in_fmt->extensions : "none", seg->url);
+            return AVERROR_INVALIDDATA;
+        }
+    }
+
+    return 0;
 }
 
 static int parse_playlist(HLSContext *c, const char *url,
@@ -811,10 +855,16 @@ static int parse_playlist(HLSContext *c, const char *url,
                                &info);
             new_rendition(c, &info, url);
         } else if (av_strstart(line, "#EXT-X-TARGETDURATION:", &ptr)) {
+            int64_t t;
             ret = ensure_playlist(c, &pls, url);
             if (ret < 0)
                 goto fail;
-            pls->target_duration = strtoll(ptr, NULL, 10) * AV_TIME_BASE;
+            t = strtoll(ptr, NULL, 10);
+            if (t < 0 || t >= INT64_MAX / AV_TIME_BASE) {
+                ret = AVERROR_INVALIDDATA;
+                goto fail;
+            }
+            pls->target_duration = t * AV_TIME_BASE;
         } else if (av_strstart(line, "#EXT-X-MEDIA-SEQUENCE:", &ptr)) {
             ret = ensure_playlist(c, &pls, url);
             if (ret < 0)
@@ -932,6 +982,14 @@ static int parse_playlist(HLSContext *c, const char *url,
                     av_free(seg->key);
                     av_free(seg);
                     ret = AVERROR(ENOMEM);
+                    goto fail;
+                }
+
+                ret = test_segment(c->ctx, pls->ctx ? pls->ctx->iformat : NULL, pls, seg);
+                if (ret < 0) {
+                    av_free(seg->url);
+                    av_free(seg->key);
+                    av_free(seg);
                     goto fail;
                 }
 
@@ -1239,12 +1297,12 @@ static int open_input(HLSContext *c, struct playlist *pls, struct segment *seg, 
            seg->url, seg->url_offset, pls->index);
 
     if (seg->key_type == KEY_NONE) {
-        ret = open_url(pls->parent, in, seg->url, c->avio_opts, opts, &is_http);
+        ret = open_url(pls->parent, in, seg->url, &c->avio_opts, opts, &is_http);
     } else if (seg->key_type == KEY_AES_128) {
         char iv[33], key[33], url[MAX_URL_SIZE];
         if (strcmp(seg->key, pls->key_url)) {
             AVIOContext *pb = NULL;
-            if (open_url(pls->parent, &pb, seg->key, c->avio_opts, opts, NULL) == 0) {
+            if (open_url(pls->parent, &pb, seg->key, &c->avio_opts, opts, NULL) == 0) {
                 ret = avio_read(pb, pls->key, sizeof(pls->key));
                 if (ret != sizeof(pls->key)) {
                     av_log(pls->parent, AV_LOG_ERROR, "Unable to read key file %s\n",
@@ -1268,7 +1326,7 @@ static int open_input(HLSContext *c, struct playlist *pls, struct segment *seg, 
         av_dict_set(&opts, "key", key, 0);
         av_dict_set(&opts, "iv", iv, 0);
 
-        ret = open_url(pls->parent, in, url, c->avio_opts, opts, &is_http);
+        ret = open_url(pls->parent, in, url, &c->avio_opts, opts, &is_http);
         if (ret < 0) {
             goto cleanup;
         }
@@ -1972,6 +2030,11 @@ static int hls_read_header(AVFormatContext *s)
         pls->ctx->max_analyze_duration = s->max_analyze_duration > 0 ? s->max_analyze_duration : 4 * AV_TIME_BASE;
         url = av_strdup(pls->segments[0]->url);
         ret = av_probe_input_buffer(&pls->pb, &in_fmt, url, NULL, 0, 0);
+
+        for (int n = 0; n < pls->n_segments; n++)
+            if (ret >= 0)
+                ret = test_segment(s, in_fmt, pls, pls->segments[n]);
+
         av_free(url);
         if (ret < 0) {
             /* Free the ctx - it isn't initialized properly at this point,
@@ -2367,8 +2430,10 @@ static const AVOption hls_options[] = {
         OFFSET(allowed_extensions), AV_OPT_TYPE_STRING,
         {.str = "3gp,aac,avi,flac,mkv,m3u8,m4a,m4s,m4v,mpg,mov,mp2,mp3,mp4,mpeg,mpegts,ogg,ogv,oga,ts,vob,wav"},
         INT_MIN, INT_MAX, FLAGS},
+    {"extension_picky", "Be picky with all extensions matching",
+        OFFSET(extension_picky), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, FLAGS},
     {"max_reload", "Maximum number of times a insufficient list is attempted to be reloaded",
-        OFFSET(max_reload), AV_OPT_TYPE_INT, {.i64 = 1000}, 0, INT_MAX, FLAGS},
+        OFFSET(max_reload), AV_OPT_TYPE_INT, {.i64 = 100}, 0, INT_MAX, FLAGS},
     {"m3u8_hold_counters", "The maximum number of times to load m3u8 when it refreshes without new segments",
         OFFSET(m3u8_hold_counters), AV_OPT_TYPE_INT, {.i64 = 1000}, 0, INT_MAX, FLAGS},
     {"http_persistent", "Use persistent HTTP connections",

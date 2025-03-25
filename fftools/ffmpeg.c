@@ -468,8 +468,9 @@ static int read_key(void)
         }
         //Read it
         if(nchars != 0) {
-            read(0, &ch, 1);
-            return ch;
+            if (read(0, &ch, 1) == 1)
+                return ch;
+            return 0;
         }else{
             return -1;
         }
@@ -528,6 +529,7 @@ static void ffmpeg_cleanup(int ret)
         for (j = 0; j < fg->nb_outputs; j++) {
             OutputFilter *ofilter = fg->outputs[j];
 
+            avfilter_inout_free(&ofilter->out_tmp);
             av_freep(&ofilter->name);
             av_freep(&ofilter->formats);
             av_freep(&ofilter->channel_layouts);
@@ -1802,7 +1804,7 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
     }
 
     if (print_stats || is_last_report) {
-        const char end = '\n'; // = is_last_report ? '\n' : '\r';
+        const char end = is_last_report ? '\n' : '\r';
         if (print_stats==1 && AV_LOG_INFO > av_log_get_level()) {
             fprintf(stderr, "%s    %c", buf.str, end);
         } else
@@ -4816,26 +4818,11 @@ static void log_callback_null(void *ptr, int level, const char *fmt, va_list vl)
 {
 }
 
-static void init_variables() {
-  input_streams     = NULL;
-  nb_input_streams  = 0;
-  input_files       = NULL;
-  nb_input_files    = 0;
-  output_streams    = NULL;
-  nb_output_streams = 0;
-  output_files      = NULL;
-  nb_output_files   = 0;
-  filtergraphs      = NULL;
-  nb_filtergraphs   = 0;
-  ffmpeg_exited     = 0;
-}
-
 int main(int argc, char **argv)
 {
     int i, ret;
     BenchmarkTimeStamps ti;
 
-    init_variables();
     init_dynload();
 
     register_exit(ffmpeg_cleanup);

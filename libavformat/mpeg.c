@@ -71,6 +71,9 @@ static int mpegps_probe(const AVProbeData *p)
             int pes  = endpes <= i && check_pes(p->buf + i, p->buf + p->buf_size);
             int pack = check_pack_header(p->buf + i);
 
+            if (len > INT_MAX - i)
+                break;
+
             if (code == SYSTEM_HEADER_START_CODE)
                 sys++;
             else if (code == PACK_START_CODE && pack)
@@ -147,9 +150,12 @@ static int mpegps_read_header(AVFormatContext *s)
 static int64_t get_pts(AVIOContext *pb, int c)
 {
     uint8_t buf[5];
+    int ret;
 
     buf[0] = c < 0 ? avio_r8(pb) : c;
-    avio_read(pb, buf + 1, 4);
+    ret = avio_read(pb, buf + 1, 4);
+    if (ret < 4)
+        return AV_NOPTS_VALUE;
 
     return ff_parse_pes_pts(buf);
 }
@@ -548,7 +554,9 @@ redo:
         static const unsigned char avs_seqh[4] = { 0, 0, 1, 0xb0 };
         unsigned char buf[8];
 
-        avio_read(s->pb, buf, 8);
+        ret = avio_read(s->pb, buf, 8);
+        if (ret != 8)
+            return AVERROR_INVALIDDATA;
         avio_seek(s->pb, -8, SEEK_CUR);
         if (!memcmp(buf, avs_seqh, 4) && (buf[6] != 0 || buf[7] != 1))
             codec_id = AV_CODEC_ID_CAVS;

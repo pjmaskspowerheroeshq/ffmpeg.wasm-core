@@ -182,7 +182,7 @@ static AVIOContext * wtvfile_open_sector(unsigned first_sector, uint64_t length,
         int nb_sectors1 = read_ints(s->pb, sectors1, WTV_SECTOR_SIZE / 4);
         int i;
 
-        wf->sectors = av_malloc_array(nb_sectors1, 1 << WTV_SECTOR_BITS);
+        wf->sectors = av_calloc(nb_sectors1, 1 << WTV_SECTOR_BITS);
         if (!wf->sectors) {
             av_free(wf);
             return NULL;
@@ -271,6 +271,11 @@ static AVIOContext * wtvfile_open2(AVFormatContext *s, const uint8_t *buf, int b
         if (name_size < 0) {
             av_log(s, AV_LOG_ERROR,
                    "bad filename length, remaining directory entries ignored\n");
+            break;
+        }
+        if (dir_length == 0) {
+            av_log(s, AV_LOG_ERROR,
+                   "bad dir length, remaining directory entries ignored\n");
             break;
         }
         if (48 + (int64_t)name_size > buf_end - buf) {
@@ -655,6 +660,8 @@ static AVStream * parse_media_type(AVFormatContext *s, AVStream *st, int sid,
         avio_skip(pb, size - 32);
         ff_get_guid(pb, &actual_subtype);
         ff_get_guid(pb, &actual_formattype);
+        if (avio_feof(pb))
+            return NULL;
         avio_seek(pb, -size, SEEK_CUR);
 
         st = parse_media_type(s, st, sid, mediatype, actual_subtype, actual_formattype, size - 32);
@@ -789,7 +796,7 @@ static int parse_chunks(AVFormatContext *s, int mode, int64_t seekts, int *len_p
 
         ff_get_guid(pb, &g);
         len = avio_rl32(pb);
-        if (len < 32) {
+        if (len < 32 || len > INT_MAX - 7) {
             int ret;
             if (avio_feof(pb))
                 return AVERROR_EOF;
@@ -812,6 +819,8 @@ static int parse_chunks(AVFormatContext *s, int mode, int64_t seekts, int *len_p
                 avio_skip(pb, 12);
                 ff_get_guid(pb, &formattype);
                 size = avio_rl32(pb);
+                if (size < 0 || size > INT_MAX - 92 - consumed)
+                    return AVERROR_INVALIDDATA;
                 parse_media_type(s, 0, sid, mediatype, subtype, formattype, size);
                 consumed += 92 + size;
             }
@@ -826,6 +835,8 @@ static int parse_chunks(AVFormatContext *s, int mode, int64_t seekts, int *len_p
                 avio_skip(pb, 12);
                 ff_get_guid(pb, &formattype);
                 size = avio_rl32(pb);
+                if (size < 0 || size > INT_MAX - 76 - consumed)
+                    return AVERROR_INVALIDDATA;
                 parse_media_type(s, s->streams[stream_index], sid, mediatype, subtype, formattype, size);
                 consumed += 76 + size;
             }
@@ -838,7 +849,7 @@ static int parse_chunks(AVFormatContext *s, int mode, int64_t seekts, int *len_p
             int stream_index = ff_find_stream_index(s, sid);
             if (stream_index >= 0) {
                 AVStream *st = s->streams[stream_index];
-                uint8_t buf[258];
+                uint8_t buf[258] = {0};
                 const uint8_t *pbuf = buf;
                 int buf_size;
 
@@ -851,7 +862,8 @@ static int parse_chunks(AVFormatContext *s, int mode, int64_t seekts, int *len_p
                 }
 
                 buf_size = FFMIN(len - consumed, sizeof(buf));
-                avio_read(pb, buf, buf_size);
+                if (avio_read(pb, buf, buf_size) != buf_size)
+                    return AVERROR_INVALIDDATA;
                 consumed += buf_size;
                 ff_parse_mpeg2_descriptor(s, st, 0, &pbuf, buf + buf_size, NULL, 0, 0, NULL);
             }

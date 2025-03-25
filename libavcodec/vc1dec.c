@@ -344,7 +344,7 @@ av_cold int ff_vc1_decode_init_alloc_tables(VC1Context *v)
     if (!v->block || !v->cbp_base)
         goto error;
     v->cbp              = v->cbp_base + 2 * s->mb_stride;
-    v->ttblk_base       = av_malloc(sizeof(v->ttblk_base[0]) * 3 * s->mb_stride);
+    v->ttblk_base       = av_mallocz(sizeof(v->ttblk_base[0]) * 3 * s->mb_stride);
     if (!v->ttblk_base)
         goto error;
     v->ttblk            = v->ttblk_base + 2 * s->mb_stride;
@@ -358,7 +358,7 @@ av_cold int ff_vc1_decode_init_alloc_tables(VC1Context *v)
     v->luma_mv          = v->luma_mv_base + 2 * s->mb_stride;
 
     /* allocate block type info in that way so it could be used with s->block_index[] */
-    v->mb_type_base = av_malloc(s->b8_stride * (mb_height * 2 + 1) + s->mb_stride * (mb_height + 1) * 2);
+    v->mb_type_base = av_mallocz(s->b8_stride * (mb_height * 2 + 1) + s->mb_stride * (mb_height + 1) * 2);
     if (!v->mb_type_base)
         goto error;
     v->mb_type[0]   = v->mb_type_base + s->b8_stride + 1;
@@ -608,6 +608,7 @@ av_cold int ff_vc1_decode_end(AVCodecContext *avctx)
     av_freep(&v->hrd_rate);
     av_freep(&v->hrd_buffer);
     ff_mpv_common_end(&v->s);
+    memset(v->s.block_index, 0, sizeof(v->s.block_index));
     av_freep(&v->mv_type_mb_plane);
     av_freep(&v->direct_mb_plane);
     av_freep(&v->forward_mb_plane);
@@ -1135,7 +1136,9 @@ static int vc1_decode_frame(AVCodecContext *avctx, void *data,
             ret = AVERROR_INVALIDDATA;
             goto err;
         }
-        if (!v->field_mode)
+        if (   !v->field_mode
+            && avctx->codec_id != AV_CODEC_ID_WMV3IMAGE
+            && avctx->codec_id != AV_CODEC_ID_VC1IMAGE)
             ff_er_frame_end(&s->er);
     }
 
@@ -1158,12 +1161,14 @@ image:
         if (s->pict_type == AV_PICTURE_TYPE_B || s->low_delay) {
             if ((ret = av_frame_ref(pict, s->current_picture_ptr->f)) < 0)
                 goto err;
-            ff_print_debug_info(s, s->current_picture_ptr, pict);
+            if (!v->field_mode)
+                ff_print_debug_info(s, s->current_picture_ptr, pict);
             *got_frame = 1;
         } else if (s->last_picture_ptr) {
             if ((ret = av_frame_ref(pict, s->last_picture_ptr->f)) < 0)
                 goto err;
-            ff_print_debug_info(s, s->last_picture_ptr, pict);
+            if (!v->field_mode)
+                ff_print_debug_info(s, s->last_picture_ptr, pict);
             *got_frame = 1;
         }
     }
